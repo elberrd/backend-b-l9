@@ -1,0 +1,14 @@
+{
+    "host": "https://api.us-east.tinybird.co",
+    "id": "a8fcf7c9-e663-4deb-9fb3-b9027c4eeaf1",
+    "name": "iai_baush",
+    "scope": "user",
+    "token": "p.eyJ1IjogImE4ZmNmN2M5LWU2NjMtNGRlYi05ZmIzLWI5MDI3YzRlZWFmMSIsICJpZCI6ICJhNDAwN2I2ZS04NzQyLTRhMDMtYjczZC1kNmU2YWEyZDE3OTciLCAiaG9zdCI6ICJ1c19lYXN0In0.6MTCcY111SMuv6B4IY4MVsYHulb0wATDkwAII06NYK0",
+    "tokens": {
+        "https://api.us-east.tinybird.co": "p.eyJ1IjogImE4ZmNmN2M5LWU2NjMtNGRlYi05ZmIzLWI5MDI3YzRlZWFmMSIsICJpZCI6ICJhNDAwN2I2ZS04NzQyLTRhMDMtYjczZC1kNmU2YWEyZDE3OTciLCAiaG9zdCI6ICJ1c19lYXN0In0.6MTCcY111SMuv6B4IY4MVsYHulb0wATDkwAII06NYK0"
+    },
+    "user_email": "elberrd@gmail.com",
+    "user_id": "91a9fa49-b924-480a-b158-29a09f67c2fd",
+    "user_token": "p.eyJ1IjogIjkxYTlmYTQ5LWI5MjQtNDgwYS1iMTU4LTI5YTA5ZjY3YzJmZCIsICJpZCI6ICIxYzM1YjcwYS1iNjM4LTRlN2MtYTI2My1lMThhMGM0MjM0NDkiLCAiaG9zdCI6ICJ1c19lYXN0In0.u2EbUedMw8M5kXwpI083d5P3UV6ASG0qv62yFUMZ7dc",
+    "version": "1.1.7"
+}
