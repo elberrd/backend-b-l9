@@ -159,6 +159,15 @@ class ScrapeResult:
     deliveryTime: Optional[str] = None
     review_score: Optional[str] = None
     installmentOptions: Optional[str] = None
+    kit: Optional[bool] = None
+    unitMeasurement: Optional[str] = None
+    outOfStockReason: Optional[str] = None
+    marketplaceWebsite: Optional[str] = None
+    sku: Optional[str] = None
+    ean: Optional[str] = None
+    stockQuantity: Optional[int] = None
+    otherPaymentMethods: Optional[str] = None
+    promotionDetails: Optional[str] = None
     method: Optional[str] = None
     attempts: Optional[List[str]] = None
     errors: Optional[List[dict]] = None  # Array of errors from failed attempts
@@ -174,8 +183,9 @@ class ScrapeResult:
             "errorMessage", "screenshotUrl", "productTitle", "brand",
             "currentPrice", "originalPrice", "discountPercentage", "currency",
             "availability", "imageUrl", "seller", "shippingInfo", "shippingCost",
-            "deliveryTime", "review_score", "installmentOptions", "method", "attempts",
-            "errors"
+            "deliveryTime", "review_score", "installmentOptions", "kit", "unitMeasurement",
+            "outOfStockReason", "marketplaceWebsite", "sku", "ean", "stockQuantity",
+            "otherPaymentMethods", "promotionDetails", "method", "attempts", "errors"
         ]:
             value = getattr(self, field_name)
             if value is not None:
@@ -661,6 +671,15 @@ Extract and return a JSON object with these fields:
 - installmentOptions: Payment installment info (e.g., "10x de R$ 15,90")
 - imageUrl: Main product image URL
 - review_score: Review rating if found
+- kit: Boolean if this is a kit/bundle
+- unitMeasurement: Product unit/size (e.g., "100ml", "500g")
+- outOfStockReason: Reason if product is not available
+- marketplaceWebsite: Website/marketplace name (e.g., "Amazon", "Mercado Livre")
+- sku: Product SKU code
+- ean: Product EAN/barcode
+- stockQuantity: Quantity in stock as a number
+- otherPaymentMethods: Other payment methods available (e.g., "PIX, Boleto")
+- promotionDetails: Promotion details if any
 
 Return ONLY valid JSON, no markdown or explanation. Omit fields not found."""
 
@@ -956,7 +975,9 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
             for field in ["productTitle", "brand", "currentPrice", "originalPrice",
                           "discountPercentage", "currency", "availability", "imageUrl",
                           "seller", "shippingInfo", "shippingCost", "deliveryTime",
-                          "review_score", "installmentOptions"]:
+                          "review_score", "installmentOptions", "kit", "unitMeasurement",
+                          "outOfStockReason", "marketplaceWebsite", "sku", "ean",
+                          "stockQuantity", "otherPaymentMethods", "promotionDetails"]:
                 setattr(result, field, product_data.get(field))
 
             print(f"[{url_id}] Completed in {time.time() - start_time:.2f}s")
