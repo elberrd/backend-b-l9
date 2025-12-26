@@ -1,8 +1,31 @@
 """
-Modal-based Web Scraper v3.2 (Optimized Configuration)
-=======================================================
+Modal-based Web Scraper v3.3 (With Initial Data Override)
+==========================================================
 Scalable web scraper using Modal.com infrastructure with 3-tier fallback system.
 Fully async implementation with optimized container/concurrency configuration.
+
+NEW IN v3.3: Initial Data Override
+----------------------------------
+Input JSON can include additional fields that will OVERRIDE scraped data:
+- companyName, alertId, hasAlert, screenshotId (metadata fields)
+- productTitle, seller, brand, etc. (product fields)
+
+This ensures user-provided metadata is preserved in the final Tinybird output.
+The URL can be specified as either 'url' or 'productUrl'.
+
+Example Input:
+    {
+        "urls": [
+            {
+                "urlId": "test_001",
+                "url": "https://example.com/product",
+                "companyName": "My Company",       // Will override scraped data
+                "alertId": "alert_123",            // Will be added to output
+                "productTitle": "Custom Title",   // Will override scraped title
+                "method": "brightdata"            // Force specific scraper
+            }
+        ]
+    }
 
 Scraping Priority (configurable via PRIMARY_SCRAPER):
 - If PRIMARY_SCRAPER=firecrawl: Firecrawl -> Bright Data -> Playwright
@@ -23,6 +46,9 @@ Environment Variables:
 - MAX_CONTAINERS: Override max containers
 - MAX_INPUTS: Override max inputs per container
 - TINYBIRD_TOKEN: Token for Tinybird Events API (sends scrape results to database)
+- FIRECRAWL_RETRIES: Retries for Firecrawl (default: 1, set to 0 to disable)
+- BRIGHTDATA_RETRIES: Retries for Bright Data (default: 3, set to 0 to disable)
+- PLAYWRIGHT_RETRIES: Retries for Playwright (default: 2, set to 0 to disable)
 
 Usage:
     modal run app/modal_scraper.py
@@ -86,6 +112,12 @@ METHOD_PLAYWRIGHT = "playwright"
 # Primary scraper options
 PRIMARY_FIRECRAWL = "firecrawl"
 PRIMARY_BRIGHTDATA = "brightdata"
+
+# Default retry configuration (can be overridden via environment variables)
+# Set to 0 to disable a method entirely
+DEFAULT_FIRECRAWL_RETRIES = 1    # Firecrawl: often blocked, 1 attempt
+DEFAULT_BRIGHTDATA_RETRIES = 3   # Bright Data: reliable, worth retrying
+DEFAULT_PLAYWRIGHT_RETRIES = 2   # Playwright: local browser, worth retrying
 
 # Tinybird configuration
 TINYBIRD_HOST = "https://api.us-east.tinybird.co"
@@ -167,7 +199,7 @@ class ScrapeResult:
     discountPercentage: Optional[float] = None
     currency: Optional[str] = None
     availability: Optional[bool] = None
-    imageUrl: Optional[str] = None
+    product_image_url: Optional[str] = None
     seller: Optional[str] = None
     shippingInfo: Optional[str] = None
     shippingCost: Optional[float] = None
@@ -186,6 +218,11 @@ class ScrapeResult:
     method: Optional[str] = None
     attempts: Optional[List[str]] = None
     errors: Optional[List[dict]] = None  # Array of errors from failed attempts
+    # New fields from Tinybird schema
+    alertId: Optional[str] = None
+    companyName: Optional[str] = None
+    hasAlert: Optional[bool] = None
+    screenshotId: Optional[str] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -197,10 +234,11 @@ class ScrapeResult:
         for field_name in [
             "errorMessage", "screenshotUrl", "productTitle", "brand",
             "currentPrice", "originalPrice", "discountPercentage", "currency",
-            "availability", "imageUrl", "seller", "shippingInfo", "shippingCost",
+            "availability", "product_image_url", "seller", "shippingInfo", "shippingCost",
             "deliveryTime", "review_score", "installmentOptions", "kit", "unitMeasurement",
             "outOfStockReason", "marketplaceWebsite", "sku", "ean", "stockQuantity",
-            "otherPaymentMethods", "promotionDetails", "method", "attempts", "errors"
+            "otherPaymentMethods", "promotionDetails", "method", "attempts", "errors",
+            "alertId", "companyName", "hasAlert", "screenshotId"
         ]:
             value = getattr(self, field_name)
             if value is not None:
@@ -212,58 +250,437 @@ class ScrapeResult:
 # HTML Cleaner
 # =============================================================================
 
+# =============================================================================
+# CSS Selector Patterns for E-commerce Data Extraction
+# =============================================================================
+# These patterns use PARTIAL MATCHING (contains) which is the RECOMMENDED approach:
+#
+# WHY PARTIAL MATCHING IS GOOD:
+# 1. Catches BEM variations: "product__price", "product-price", "product_price"
+# 2. Handles prefixed classes: "pdp-price-box", "main-product-title"
+# 3. Works across platforms: VTEX, Magento, WooCommerce, Shopify, custom sites
+# 4. Resilient to site-specific naming: "raia-price", "amazon-price", etc.
+# 5. More robust than exact matching for diverse e-commerce sites
+#
+# CAUTION: Very short patterns might match unintended elements
+# (e.g., "de" in Spanish could match "header"). Use minimum 3-4 char patterns.
+# =============================================================================
+
+# Organized by data field with patterns in English, Portuguese, and Spanish
+SELECTOR_PATTERNS = {
+    # Product identification (title, name, heading)
+    "product_title": (
+        # English
+        r"product|item|article|goods|merchandise|listing|"
+        r"title|name|heading|header|headline|"
+        r"pdp|plp|detail|description|"
+        # Portuguese
+        r"produto|titulo|nome|detalhe|descricao|cabecalho|"
+        # Spanish
+        r"producto|articulo|titulo|nombre|detalle|descripcion|encabezado|"
+        # Platform-specific (VTEX, Magento, Shopify, WooCommerce)
+        r"vtex|magento|shopify|woo|"
+        r"sku-name|product-name|item-title"
+    ),
+
+    # Price (current, original, sale, discount)
+    "price": (
+        # English
+        r"price|cost|amount|value|money|fee|"
+        r"sale|offer|deal|discount|saving|"
+        r"current|original|regular|list|retail|msrp|rrp|"
+        r"old|new|final|total|subtotal|"
+        r"was|now|from|"
+        # Portuguese
+        r"preco|preço|valor|custo|quantia|"
+        r"oferta|promocao|promoção|desconto|economia|"
+        r"atual|original|antigo|novo|final|"
+        r"por|era|"  # "Por: R$ X" / "Era: R$ Y"
+        # Spanish
+        r"precio|costo|valor|importe|monto|"
+        r"oferta|promocion|promoción|descuento|ahorro|rebaja|"
+        r"actual|original|anterior|nuevo|final|"
+        r"antes|ahora|desde|"
+        # Platform-specific
+        r"best-price|sale-price|special-price|spot-price|"
+        r"price-box|price-tag|price-value|price-amount|"
+        r"instalment|installment"  # Often near price
+    ),
+
+    # Discount and promotion
+    "discount": (
+        # English
+        r"discount|save|saving|off|percent|badge|tag|"
+        r"promo|promotion|deal|special|clearance|flash|"
+        r"coupon|voucher|code|"
+        # Portuguese
+        r"desconto|economia|economize|porcento|selo|tag|"
+        r"promocao|promoção|oferta|especial|liquidacao|liquidação|"
+        r"cupom|voucher|codigo|"
+        # Spanish
+        r"descuento|ahorro|ahorra|porciento|etiqueta|"
+        r"promocion|promoción|oferta|especial|liquidacion|liquidación|"
+        r"cupon|cupón|codigo|código"
+    ),
+
+    # Payment and installments
+    "payment": (
+        # English
+        r"payment|pay|checkout|purchase|buy|"
+        r"installment|instalment|financing|credit|"
+        r"card|visa|master|amex|paypal|"
+        r"split|divide|monthly|"
+        # Portuguese
+        r"pagamento|pagar|compra|comprar|"
+        r"parcela|parcelamento|parcelado|financiamento|credito|crédito|"
+        r"cartao|cartão|pix|boleto|"
+        r"vezes|"  # "10x de R$ 15"
+        # Spanish
+        r"pago|pagar|compra|comprar|"
+        r"cuota|cuotas|financiamiento|financiacion|credito|crédito|"
+        r"tarjeta|debito|débito|"
+        r"meses|mensual|"  # "12 meses sin intereses"
+        # Platform-specific
+        r"installment-option|payment-method|checkout-button"
+    ),
+
+    # Shipping and delivery
+    "shipping": (
+        # English
+        r"ship|shipping|delivery|deliver|freight|dispatch|"
+        r"fulfillment|logistics|carrier|courier|"
+        r"free-ship|express|standard|overnight|"
+        r"arrive|arrival|estimated|eta|"
+        r"track|tracking|"
+        # Portuguese
+        r"frete|entrega|entregar|envio|enviar|despacho|"
+        r"transportadora|correios|sedex|pac|"
+        r"gratis|gratuito|expresso|normal|"
+        r"prazo|chegada|previsao|previsão|"
+        r"rastreio|rastrear|"
+        # Spanish
+        r"envio|envío|entrega|entregar|flete|despacho|"
+        r"transportadora|correo|mensajeria|mensajería|"
+        r"gratis|gratuito|express|estandar|estándar|"
+        r"plazo|llegada|estimado|"
+        r"rastreo|rastrear|seguimiento|"
+        # Time-related
+        r"dias|días|days|hours|horas|business|util|útil"
+    ),
+
+    # Stock and availability
+    "stock": (
+        # English
+        r"stock|inventory|available|availability|"
+        r"instock|in-stock|out-of-stock|outofstock|"
+        r"sold-out|soldout|unavailable|"
+        r"quantity|qty|units|left|remaining|"
+        r"low-stock|last-units|few-left|"
+        r"backorder|preorder|pre-order|"
+        # Portuguese
+        r"estoque|disponivel|disponível|disponibilidade|"
+        r"esgotado|indisponivel|indisponível|"
+        r"quantidade|unidades|restantes|"
+        r"ultimas|últimas|poucos|"
+        r"encomenda|reserva|"
+        # Spanish
+        r"stock|existencias|inventario|disponible|disponibilidad|"
+        r"agotado|nodisponible|no-disponible|"
+        r"cantidad|unidades|quedan|restantes|"
+        r"ultimas|últimas|ultimos|últimos|pocos|"
+        r"pedido|reserva|preventa"
+    ),
+
+    # Images (product photos, gallery, thumbnails)
+    "image": (
+        # English
+        r"image|img|photo|picture|pic|"
+        r"gallery|carousel|slider|slideshow|"
+        r"thumbnail|thumb|preview|"
+        r"zoom|magnify|lightbox|"
+        r"main-image|product-image|hero-image|"
+        r"media|visual|figure|"
+        # Portuguese
+        r"imagem|foto|fotografia|figura|"
+        r"galeria|carrossel|"
+        r"miniatura|mini|"
+        r"ampliar|zoom|"
+        # Spanish
+        r"imagen|foto|fotografía|fotografía|figura|"
+        r"galeria|galería|carrusel|"
+        r"miniatura|vista-previa|"
+        r"ampliar|zoom"
+    ),
+
+    # Brand and manufacturer
+    "brand": (
+        # English
+        r"brand|manufacturer|maker|vendor|"
+        r"supplier|producer|"
+        r"logo|trademark|"
+        # Portuguese
+        r"marca|fabricante|fornecedor|produtor|"
+        r"logo|logotipo|"
+        # Spanish
+        r"marca|fabricante|proveedor|productor|"
+        r"logo|logotipo|"
+        # Platform-specific
+        r"brand-name|product-brand|manufacturer-name"
+    ),
+
+    # Seller and store
+    "seller": (
+        # English
+        r"seller|vendor|merchant|retailer|dealer|"
+        r"shop|store|marketplace|"
+        r"sold-by|soldby|shipped-by|"
+        r"fulfilled|fulfillment|"
+        # Portuguese
+        r"vendedor|loja|lojista|comerciante|"
+        r"vendido-por|vendidopor|enviado-por|"
+        r"marketplace|parceiro|"
+        # Spanish
+        r"vendedor|tienda|comerciante|distribuidor|"
+        r"vendido-por|vendidopor|enviado-por|"
+        r"marketplace|socio|aliado"
+    ),
+
+    # Reviews and ratings
+    "review": (
+        # English
+        r"review|rating|rate|score|stars|"
+        r"feedback|testimonial|comment|opinion|"
+        r"evaluation|assessment|"
+        r"votes|voted|recommend|"
+        r"verified|helpful|"
+        # Portuguese
+        r"avaliacao|avaliação|avaliacoes|avaliações|"
+        r"nota|estrela|estrelas|"
+        r"comentario|comentário|opiniao|opinião|"
+        r"votos|recomendar|"
+        r"verificado|"
+        # Spanish
+        r"resena|reseña|resenas|reseñas|"
+        r"calificacion|calificación|puntuacion|puntuación|"
+        r"estrellas|valoracion|valoración|"
+        r"comentario|opinion|opinión|"
+        r"votos|recomendar|"
+        r"verificado"
+    ),
+
+    # SKU, EAN, product codes
+    "sku_code": (
+        # Universal codes
+        r"sku|upc|ean|gtin|asin|mpn|isbn|"
+        r"barcode|bar-code|"
+        r"part-number|model-number|"
+        r"ref|reference|"
+        r"code|codigo|código|"
+        # Portuguese
+        r"referencia|referência|modelo|"
+        # Spanish
+        r"referencia|modelo|numero-parte"
+    ),
+
+    # Kit and bundle
+    "kit": (
+        # English
+        r"kit|bundle|pack|set|combo|"
+        r"collection|group|multipack|multi-pack|"
+        r"package|assortment|variety|"
+        # Portuguese
+        r"kit|conjunto|combo|pacote|"
+        r"colecao|coleção|sortido|"
+        # Spanish
+        r"kit|paquete|combo|conjunto|"
+        r"coleccion|colección|surtido|variedad"
+    ),
+
+    # Unit and measurement
+    "unit": (
+        # English
+        r"unit|size|weight|volume|quantity|"
+        r"measure|dimension|capacity|"
+        r"per-unit|each|piece|"
+        # Portuguese
+        r"unidade|tamanho|peso|volume|quantidade|"
+        r"medida|dimensao|dimensão|capacidade|"
+        r"cada|peca|peça|"
+        # Spanish
+        r"unidad|tamano|tamaño|peso|volumen|cantidad|"
+        r"medida|dimension|dimensión|capacidad|"
+        r"cada|pieza|"
+        # Common units (universal)
+        r"ml|mg|kg|lb|oz|cm|mm|inch|"
+        r"liter|litro|gram|grama|gramo"
+    ),
+
+    # Buy button and CTA (Call to Action)
+    "buy_cta": (
+        # English
+        r"buy|purchase|add-to-cart|addtocart|"
+        r"add-cart|cart|basket|bag|"
+        r"checkout|order|get-it|"
+        r"cta|action|button|btn|"
+        # Portuguese
+        r"comprar|adicionar|carrinho|sacola|bolsa|"
+        r"finalizar|pedido|"
+        r"botao|botão|"
+        # Spanish
+        r"comprar|agregar|carrito|canasta|bolsa|"
+        r"finalizar|pedido|"
+        r"boton|botón"
+    ),
+
+    # Warranty and guarantee
+    "warranty": (
+        # English
+        r"warranty|guarantee|protection|"
+        r"coverage|policy|return|refund|"
+        # Portuguese
+        r"garantia|protecao|proteção|"
+        r"cobertura|politica|política|devolucao|devolução|reembolso|"
+        # Spanish
+        r"garantia|garantía|proteccion|protección|"
+        r"cobertura|politica|política|devolucion|devolución|reembolso"
+    ),
+}
+
+
 def clean_html(html_content: str) -> Tuple[str, dict]:
-    """Clean HTML content to reduce tokens while preserving product information."""
+    """
+    Clean HTML content to reduce tokens while preserving product information.
+
+    Uses partial matching (contains) for CSS selectors - this is the recommended
+    approach because it catches variations like BEM naming, platform prefixes,
+    and site-specific customizations.
+    """
     from bs4 import BeautifulSoup, Comment
 
     soup = BeautifulSoup(html_content, 'lxml')
 
-    # Preserve important scripts
+    # Preserve important scripts (JSON-LD, Next.js data, etc.)
     important_scripts = []
+    script_keywords = [
+        # Product data
+        'product', 'price', 'sku', 'stock', 'inventory',
+        # Portuguese
+        'preco', 'preço', 'produto', 'estoque',
+        # Spanish
+        'precio', 'producto', 'existencias',
+        # Platforms
+        'catalog', 'vtex', 'magento', 'shopify', 'woocommerce',
+        # Schema.org
+        'schema', '@type', 'offer', 'aggregaterating'
+    ]
+
     for script in soup.find_all('script'):
         script_content = str(script.string or '')
         script_type = script.get('type', '')
+        script_id = script.get('id', '')
         should_keep = (
             script_type in ['application/ld+json', 'application/json'] or
-            script.get('id') == '__NEXT_DATA__' or
-            any(kw in script_content.lower() for kw in ['product', 'price', 'preco', 'sku', 'catalog', 'vtex'])
+            script_id in ['__NEXT_DATA__', '__NUXT_DATA__', 'schema-org'] or
+            any(kw in script_content.lower() for kw in script_keywords)
         )
         if should_keep:
             important_scripts.append(str(script))
 
+    # Remove non-essential elements
     for script in soup.find_all('script'):
         script.decompose()
-    for tag in ['style', 'noscript', 'iframe', 'svg', 'link']:
+    for tag in ['style', 'noscript', 'iframe', 'svg', 'link', 'footer', 'nav']:
         for el in soup.find_all(tag):
             el.decompose()
     for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
         comment.extract()
 
-    # Find product areas
+    # Build combined regex for all selector patterns
+    all_patterns = '|'.join(SELECTOR_PATTERNS.values())
+    combined_regex = re.compile(all_patterns, re.I)
+
+    # Find all elements with matching class names
     product_areas = []
-    for selector in [
-        {'class': re.compile('product|item|detail|pdp|sku', re.I)},
-        {'class': re.compile('price|cost|value|amount|money', re.I)},
-        {'class': re.compile('buy|purchase|cart|add|comprar', re.I)},
-        {'class': re.compile('payment|installment|parcel|pix', re.I)},
-        {'class': re.compile('ship|delivery|frete|entrega', re.I)},
-        {'class': re.compile('stock|availability|disponib', re.I)},
-        {'class': re.compile('review|rating|score|estrela', re.I)},
-    ]:
-        product_areas.extend(soup.find_all(attrs=selector, limit=10))
+    for element in soup.find_all(attrs={'class': combined_regex}, limit=50):
+        product_areas.append(str(element))
 
-    # Get meta tags
-    meta_tags = [str(m) for m in soup.find_all('meta')
-                 if any(kw in m.get('name', '').lower() + m.get('property', '').lower()
-                       for kw in ['product', 'price', 'title', 'description', 'og:'])]
+    # Also find by id attribute
+    for element in soup.find_all(attrs={'id': combined_regex}, limit=20):
+        product_areas.append(str(element))
 
-    unique_areas = list(set(str(a) for a in product_areas[:15]))
-    combined = "\n".join(meta_tags + unique_areas + important_scripts)
+    # Also find by data-* attributes (common in React/Vue/Angular)
+    data_patterns = re.compile(r'data-(product|price|sku|stock|brand|seller|image)', re.I)
+    for element in soup.find_all(lambda tag: any(data_patterns.match(attr) for attr in tag.attrs.keys() if attr.startswith('data-')), limit=20):
+        product_areas.append(str(element))
+
+    # Get product images directly
+    product_images = []
+    image_skip_patterns = ['icon', 'logo', 'sprite', 'pixel', 'tracking', 'analytics', 'badge', 'flag', 'banner', 'ad-', 'advertisement']
+
+    for img in soup.find_all('img', limit=30):
+        src = img.get('src', '') or img.get('data-src', '') or img.get('data-lazy', '') or ''
+        srcset = img.get('srcset', '') or img.get('data-srcset', '') or ''
+
+        # Keep images that are likely product images
+        if (src or srcset) and len(src + srcset) > 20:
+            if not any(skip in (src + srcset).lower() for skip in image_skip_patterns):
+                product_images.append(str(img))
+
+    # Get meta tags (OpenGraph, Twitter Cards, Schema.org hints)
+    meta_keywords = [
+        'product', 'price', 'amount', 'currency',
+        'title', 'name', 'description',
+        'image', 'og:', 'twitter:',
+        'brand', 'manufacturer',
+        'availability', 'sku',
+        'review', 'rating'
+    ]
+    meta_tags = []
+    for m in soup.find_all('meta'):
+        meta_name = m.get('name', '').lower()
+        meta_property = m.get('property', '').lower()
+        meta_itemprop = m.get('itemprop', '').lower()
+        combined_attrs = meta_name + meta_property + meta_itemprop
+        if any(kw in combined_attrs for kw in meta_keywords):
+            meta_tags.append(str(m))
+
+    # Get elements with itemprop (Schema.org microdata)
+    schema_props = [
+        'name', 'description', 'image', 'brand', 'sku', 'gtin', 'mpn',
+        'price', 'priceCurrency', 'availability', 'seller',
+        'aggregateRating', 'ratingValue', 'reviewCount', 'offers'
+    ]
+    schema_elements = []
+    for prop in schema_props:
+        for el in soup.find_all(attrs={'itemprop': prop}, limit=5):
+            schema_elements.append(str(el))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_areas = []
+    for area in product_areas[:30]:
+        area_hash = hash(area)
+        if area_hash not in seen:
+            seen.add(area_hash)
+            unique_areas.append(area)
+
+    # Combine all extracted content
+    combined = "\n".join(
+        meta_tags +
+        schema_elements +
+        product_images[:10] +
+        unique_areas +
+        important_scripts
+    )
 
     stats = {
         "original_size": len(html_content),
         "cleaned_size": len(combined),
         "reduction_pct": round((1 - len(combined) / len(html_content)) * 100, 1) if html_content else 0,
+        "areas_found": len(unique_areas),
+        "images_found": len(product_images),
+        "meta_tags_found": len(meta_tags),
+        "schema_elements_found": len(schema_elements),
     }
     return combined, stats
 
@@ -273,16 +690,17 @@ def clean_html(html_content: str) -> Tuple[str, dict]:
 # =============================================================================
 
 def compress_image(image_bytes: bytes, quality: int = 85) -> Tuple[bytes, dict]:
-    """Compress PNG image to optimized JPEG."""
+    """Compress PNG image to optimized WebP."""
     from PIL import Image
 
     original_size = len(image_bytes)
     img = Image.open(BytesIO(image_bytes))
-    if img.mode in ('RGBA', 'P'):
-        img = img.convert('RGB')
+    # WebP supports RGBA, no need to convert unless we want to reduce size further
+    if img.mode == 'P':
+        img = img.convert('RGBA')
 
     output = BytesIO()
-    img.save(output, format='JPEG', quality=quality, optimize=True)
+    img.save(output, format='WEBP', quality=quality, method=6)  # method=6 = best compression
     compressed = output.getvalue()
 
     stats = {
@@ -348,8 +766,8 @@ def upload_to_r2_sync(image_bytes: bytes, url_id: str) -> Tuple[Optional[str], O
 
     try:
         now = datetime.utcnow()
-        filename = f"screenshots/{now.strftime('%Y/%m/%d')}/{url_id}_{uuid.uuid4().hex[:8]}.jpg"
-        client.put_object(Bucket=bucket_name, Key=filename, Body=image_bytes, ContentType='image/jpeg')
+        filename = f"screenshots/{now.strftime('%Y/%m/%d')}/{url_id}_{uuid.uuid4().hex[:8]}.webp"
+        client.put_object(Bucket=bucket_name, Key=filename, Body=image_bytes, ContentType='image/webp')
         return f"{public_url.rstrip('/')}/{filename}", None
     except Exception as e:
         return None, f"R2 upload error: {str(e)[:200]}"
@@ -498,7 +916,7 @@ class TinybirdBatcher:
             "discountPercentage": scrape_result.get("discountPercentage"),
             "currency": scrape_result.get("currency"),
             "availability": 1 if scrape_result.get("availability") else (0 if scrape_result.get("availability") is False else None),
-            "imageUrl": scrape_result.get("imageUrl"),
+            "imageUrl": scrape_result.get("product_image_url"),
             "seller": scrape_result.get("seller"),
             "sellerName": scrape_result.get("seller"),
             "shippingInfo": scrape_result.get("shippingInfo"),
@@ -518,6 +936,11 @@ class TinybirdBatcher:
             "method": scrape_result.get("method"),
             "attempts": json.dumps(scrape_result.get("attempts")) if scrape_result.get("attempts") else None,
             "errors": json.dumps(scrape_result.get("errors")) if scrape_result.get("errors") else None,
+            # New fields from Tinybird schema
+            "alertId": scrape_result.get("alertId"),
+            "companyName": scrape_result.get("companyName"),
+            "hasAlert": 1 if scrape_result.get("hasAlert") else (0 if scrape_result.get("hasAlert") is False else None),
+            "screenshotId": scrape_result.get("screenshotId"),
         }
 
         return {k: v for k, v in record.items() if v is not None}
@@ -802,6 +1225,8 @@ async def attempt_brightdata_async(url: str, url_id: str) -> AttemptResult:
                 if screen_response.status_code == 200 and len(screen_response.content) > 1000:
                     screenshot_bytes = screen_response.content
                     print(f"[{url_id}] Bright Data: Screenshot {len(screenshot_bytes):,} bytes")
+                else:
+                    print(f"[{url_id}] Bright Data: Screenshot failed - status={screen_response.status_code}, size={len(screen_response.content)} bytes")
             except Exception as e:
                 print(f"[{url_id}] Bright Data: Screenshot error: {str(e)[:50]}")
 
@@ -923,6 +1348,83 @@ async def attempt_playwright_async(url: str, url_id: str) -> AttemptResult:
 # Gemini Extraction (Async)
 # =============================================================================
 
+def repair_truncated_json(text: str) -> str:
+    """
+    Attempt to repair truncated or malformed JSON.
+
+    Common issues:
+    - Truncated at end (missing closing braces)
+    - Trailing commas
+    - Incomplete string values
+    """
+    text = text.strip()
+
+    # Remove markdown code blocks
+    if text.startswith('```'):
+        lines = text.split('\n')
+        # Remove first line (```json or ```)
+        lines = lines[1:]
+        # Remove last line if it's ```
+        if lines and lines[-1].strip() == '```':
+            lines = lines[:-1]
+        text = '\n'.join(lines)
+
+    # Remove any trailing ``` that might be in the middle
+    if '```' in text:
+        text = text.split('```')[0]
+
+    text = text.strip()
+
+    # Count braces to check if truncated
+    open_braces = text.count('{')
+    close_braces = text.count('}')
+    open_brackets = text.count('[')
+    close_brackets = text.count(']')
+
+    # If truncated, try to fix
+    if open_braces > close_braces or open_brackets > close_brackets:
+        # Remove incomplete last line (often truncated mid-value)
+        lines = text.rstrip().split('\n')
+
+        # Check if last line is incomplete (no comma or closing brace)
+        while lines:
+            last_line = lines[-1].strip()
+            # If line ends properly, stop
+            if last_line.endswith((',', '{', '[', '}', ']', 'true', 'false', 'null')) or \
+               (last_line.endswith('"') and ':' not in last_line):
+                break
+            # If line has unclosed string, remove it
+            if last_line.count('"') % 2 != 0:
+                lines.pop()
+                continue
+            # If line doesn't end with proper JSON, remove it
+            if not any(last_line.endswith(c) for c in (',', '{', '[', '}', ']', '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'true', 'false', 'null')):
+                lines.pop()
+                continue
+            break
+
+        text = '\n'.join(lines)
+
+        # Remove trailing comma before adding closing braces
+        text = text.rstrip()
+        if text.endswith(','):
+            text = text[:-1]
+
+        # Add missing closing braces/brackets
+        open_braces = text.count('{')
+        close_braces = text.count('}')
+        open_brackets = text.count('[')
+        close_brackets = text.count(']')
+
+        text += ']' * (open_brackets - close_brackets)
+        text += '}' * (open_braces - close_braces)
+
+    # Remove trailing commas before closing braces (common JSON error)
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+
+    return text
+
+
 async def extract_product_data_async(html_content: str, url: str, url_id: str) -> Tuple[Optional[dict], Optional[str]]:
     """Extract product data using async Gemini."""
     from google import genai
@@ -961,7 +1463,7 @@ Extract and return a JSON object with these fields:
 - shippingCost: Shipping cost as a number
 - deliveryTime: Estimated delivery time
 - installmentOptions: Payment installment info (e.g., "10x de R$ 15,90")
-- imageUrl: Main product image URL
+- product_image_url: Main product image URL
 - review_score: Review rating if found
 - kit: Boolean if this is a kit/bundle
 - unitMeasurement: Product unit/size (e.g., "100ml", "500g")
@@ -973,20 +1475,31 @@ Extract and return a JSON object with these fields:
 - otherPaymentMethods: Other payment methods available (e.g., "PIX, Boleto")
 - promotionDetails: Promotion details if any
 
-Return ONLY valid JSON, no markdown or explanation. Omit fields not found."""
+IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. Omit fields not found.
+Keep the response concise - only include fields with actual values."""
 
-        # Use async generate
+        # Use async generate with higher token limit
         response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=4096)
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=8192)
         )
 
         text = response.text.strip()
-        if text.startswith('```'):
-            text = '\n'.join(text.split('\n')[1:-1])
 
-        data = json.loads(text)
+        # Try to repair truncated/malformed JSON
+        repaired_text = repair_truncated_json(text)
+
+        try:
+            data = json.loads(repaired_text)
+        except json.JSONDecodeError:
+            # If repair failed, try original text with basic cleanup
+            text_clean = text.strip()
+            if text_clean.startswith('```'):
+                text_clean = '\n'.join(text_clean.split('\n')[1:])
+            if text_clean.endswith('```'):
+                text_clean = text_clean[:-3]
+            data = json.loads(text_clean)
 
         # Debug: show what Gemini extracted
         print(f"[{url_id}] Gemini extracted: {json.dumps(data, ensure_ascii=False)[:500]}")
@@ -1005,6 +1518,103 @@ Return ONLY valid JSON, no markdown or explanation. Omit fields not found."""
 
 
 # =============================================================================
+# Input Data Helpers
+# =============================================================================
+
+def extract_url_from_item(item: dict) -> Optional[str]:
+    """
+    Extract the URL to scrape from an input item.
+
+    Looks for 'url' or 'productUrl' fields.
+    Returns None if no valid URL found.
+    """
+    # Try 'url' first, then 'productUrl'
+    url = item.get("url") or item.get("productUrl")
+    if url and isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def extract_initial_data(item: dict) -> dict:
+    """
+    Extract initial data from input item that should override scraped data.
+
+    These fields will be preserved and override any data extracted by the scraper.
+    This ensures that metadata provided by the user takes precedence.
+    """
+    # Fields that can be provided in input and should override scraped results
+    # Mapping: input field name -> output field name (for Tinybird compatibility)
+    field_mappings = {
+        # Identity fields (always preserved)
+        "urlId": "urlId",
+        # Metadata fields from input
+        "alertId": "alertId",
+        "companyName": "companyName",
+        "hasAlert": "hasAlert",
+        "screenshotId": "screenshotId",
+        # Product fields that can be pre-filled
+        "productTitle": "productTitle",
+        "productName": "productTitle",  # productName maps to productTitle
+        "brand": "brand",
+        "brandName": "brand",  # brandName maps to brand
+        "seller": "seller",
+        "sellerName": "seller",  # sellerName maps to seller
+        "currentPrice": "currentPrice",
+        "originalPrice": "originalPrice",
+        "discountPercentage": "discountPercentage",
+        "currency": "currency",
+        "availability": "availability",
+        "imageUrl": "product_image_url",
+        "product_image_url": "product_image_url",
+        "shippingInfo": "shippingInfo",
+        "shippingCost": "shippingCost",
+        "deliveryTime": "deliveryTime",
+        "review_score": "review_score",
+        "installmentOptions": "installmentOptions",
+        "kit": "kit",
+        "unitMeasurement": "unitMeasurement",
+        "outOfStockReason": "outOfStockReason",
+        "marketplaceWebsite": "marketplaceWebsite",
+        "sku": "sku",
+        "ean": "ean",
+        "stockQuantity": "stockQuantity",
+        "otherPaymentMethods": "otherPaymentMethods",
+        "promotionDetails": "promotionDetails",
+    }
+
+    initial_data = {}
+    for input_field, output_field in field_mappings.items():
+        value = item.get(input_field)
+        if value is not None:
+            # Don't override if we already have a value for this output field
+            # (handles cases like productName and productTitle both being set)
+            if output_field not in initial_data:
+                initial_data[output_field] = value
+
+    return initial_data
+
+
+def merge_with_initial_data(result: dict, initial_data: dict) -> dict:
+    """
+    Merge scrape result with initial data, giving priority to initial data.
+
+    Initial data (provided by user) takes precedence over scraped data.
+    This ensures user-provided metadata is preserved in the final output.
+    """
+    if not initial_data:
+        return result
+
+    merged = result.copy()
+
+    for key, value in initial_data.items():
+        if value is not None:
+            # Initial data always overrides scraped data
+            merged[key] = value
+
+    return merged
+
+
+# =============================================================================
 # Main Scraper Function (Fully Async)
 # =============================================================================
 
@@ -1014,6 +1624,36 @@ def get_primary_scraper() -> str:
     if primary in (PRIMARY_FIRECRAWL, PRIMARY_BRIGHTDATA):
         return primary
     return PRIMARY_FIRECRAWL
+
+
+def get_retries_config() -> dict:
+    """
+    Get retry configuration from environment variables.
+
+    Environment variables:
+    - FIRECRAWL_RETRIES: Number of retries for Firecrawl (default: 1)
+    - BRIGHTDATA_RETRIES: Number of retries for Bright Data (default: 3)
+    - PLAYWRIGHT_RETRIES: Number of retries for Playwright (default: 2)
+
+    Setting a value to 0 disables that method entirely.
+
+    Returns:
+        dict: Mapping of method name to retry count
+    """
+    def get_retry_value(env_var: str, default: int) -> int:
+        value = os.environ.get(env_var, "")
+        if value.strip() == "":
+            return default
+        try:
+            return max(0, int(value))  # Ensure non-negative
+        except ValueError:
+            return default
+
+    return {
+        METHOD_FIRECRAWL: get_retry_value("FIRECRAWL_RETRIES", DEFAULT_FIRECRAWL_RETRIES),
+        METHOD_BRIGHTDATA: get_retry_value("BRIGHTDATA_RETRIES", DEFAULT_BRIGHTDATA_RETRIES),
+        METHOD_PLAYWRIGHT: get_retry_value("PLAYWRIGHT_RETRIES", DEFAULT_PLAYWRIGHT_RETRIES),
+    }
 
 
 def parse_method_preference(method: Optional[str]) -> Optional[str]:
@@ -1047,9 +1687,15 @@ def should_force_brightdata_for_url(url: str) -> bool:
 
     Currently checks for Mercado Livre URLs when MERCADOLIVRE_FORCE_BRIGHTDATA=true.
     """
-    mercadolivre_enabled = os.environ.get("MERCADOLIVRE_FORCE_BRIGHTDATA", "").lower() in ("true", "1", "yes")
+    mercadolivre_env = os.environ.get("MERCADOLIVRE_FORCE_BRIGHTDATA", "")
+    mercadolivre_enabled = mercadolivre_env.lower() in ("true", "1", "yes")
+    is_mercadolivre_url = "mercadolivre" in url.lower()
 
-    if mercadolivre_enabled and "mercadolivre" in url.lower():
+    # Debug log
+    if is_mercadolivre_url:
+        print(f"[DEBUG] MERCADOLIVRE_FORCE_BRIGHTDATA={mercadolivre_env!r}, enabled={mercadolivre_enabled}")
+
+    if mercadolivre_enabled and is_mercadolivre_url:
         return True
 
     return False
@@ -1129,7 +1775,7 @@ def get_max_concurrency() -> int:
     secrets=[modal.Secret.from_name("bausch")],
 )
 @modal.concurrent(max_inputs=20)  # Max possible - actual controlled by semaphore
-async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dict:
+async def scrape_url(url_id: str, url: str, method: Optional[str] = None, initial_data: Optional[dict] = None) -> dict:
     """
     Scrape a single URL with 3-tier async fallback system.
 
@@ -1137,18 +1783,27 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
         url_id: Unique identifier for this URL
         url: The URL to scrape
         method: Optional preferred method to try first (firecrawl, brightdata, playwright)
+        initial_data: Optional dict with fields from input that override scraped data
     """
     config = get_config()
     primary = get_primary_scraper()
+    retries_config = get_retries_config()
 
     # Check if user specified a method preference
     preferred_method = parse_method_preference(method)
+
+    # Log retry configuration
+    enabled_methods = [m for m, r in retries_config.items() if r > 0]
+    disabled_methods = [m for m, r in retries_config.items() if r == 0]
 
     print(f"\n{'='*60}")
     print(f"[{url_id}] Starting scrape: {url[:60]}...")
     if preferred_method:
         print(f"[{url_id}] User preferred: {preferred_method.upper()}")
     print(f"[{url_id}] Primary: {primary.upper()} | Concurrency: {config['max_concurrency']}")
+    print(f"[{url_id}] Enabled methods: {', '.join(f'{m}({retries_config[m]})' for m in enabled_methods)}")
+    if disabled_methods:
+        print(f"[{url_id}] Disabled methods: {', '.join(disabled_methods)}")
     print(f"{'='*60}")
 
     start_time = time.time()
@@ -1188,28 +1843,28 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
     else:
         attempt_order = [METHOD_FIRECRAWL, METHOD_BRIGHTDATA, METHOD_PLAYWRIGHT]
 
-    attempt_methods = [(all_methods[m][0], all_methods[m][1], m) for m in attempt_order]
+    # Filter out methods with 0 retries (disabled methods)
+    attempt_order = [m for m in attempt_order if retries_config.get(m, 0) > 0]
 
-    # Retry configuration per method
-    # Firecrawl: 1 attempt (often blocked, no point retrying)
-    # Bright Data: 3 attempts (reliable but sometimes needs retries)
-    # Playwright: 2 attempts (local browser, worth retrying)
-    RETRIES_CONFIG = {
-        METHOD_FIRECRAWL: 1,
-        METHOD_BRIGHTDATA: 3,
-        METHOD_PLAYWRIGHT: 2,
-    }
+    if not attempt_order:
+        print(f"[{url_id}] ERROR: All scraping methods are disabled!")
+        result.status = "error"
+        result.errorMessage = "All scraping methods are disabled (all retry counts set to 0)"
+        return merge_with_initial_data(result.to_dict(), initial_data)
+
+    attempt_methods = [(all_methods[m][0], all_methods[m][1], m) for m in attempt_order]
+    total_methods = len(attempt_methods)
 
     for attempt_num, (method_name, attempt_func, method_key) in enumerate(attempt_methods, 1):
-        # Determine how many retries this method gets
-        max_retries = RETRIES_CONFIG.get(method_key, 1)
+        # Get retry count from environment-based config
+        max_retries = retries_config.get(method_key, 1)
 
         attempt_result = None
         method_succeeded = False
 
         for retry in range(max_retries):
             retry_suffix = f" (attempt {retry + 1}/{max_retries})" if max_retries > 1 else ""
-            print(f"\n[{url_id}] === METHOD {attempt_num}/3: {method_name}{retry_suffix} ===")
+            print(f"\n[{url_id}] === METHOD {attempt_num}/{total_methods}: {method_name}{retry_suffix} ===")
 
             if retry == 0:
                 result.attempts.append(method_name)
@@ -1287,7 +1942,7 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
             if not result.errors:
                 result.errors = None
             for field in ["productTitle", "brand", "currentPrice", "originalPrice",
-                          "discountPercentage", "currency", "availability", "imageUrl",
+                          "discountPercentage", "currency", "availability", "product_image_url",
                           "seller", "shippingInfo", "shippingCost", "deliveryTime",
                           "review_score", "installmentOptions", "kit", "unitMeasurement",
                           "outOfStockReason", "marketplaceWebsite", "sku", "ean",
@@ -1296,8 +1951,8 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
 
             print(f"[{url_id}] Completed in {time.time() - start_time:.2f}s")
 
-            # Return result (Tinybird batching handled by process_batch)
-            return result.to_dict()
+            # Return result with initial data merged (initial data takes priority)
+            return merge_with_initial_data(result.to_dict(), initial_data)
 
         else:
             print(f"[{url_id}] {method_name}: Extraction failed - {extraction_error}")
@@ -1315,16 +1970,17 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
             last_error = extraction_error or "Could not extract price"
 
     # All failed
-    print(f"\n[{url_id}] ALL 3 ATTEMPTS FAILED")
+    print(f"\n[{url_id}] ALL {total_methods} METHOD(S) FAILED")
     result.status = "error"
+    result.method = "erro"  # Mark method as "erro" when all methods fail
     result.errorMessage = last_error or "All methods failed"
     result.screenshotUrl = last_screenshot_url
     # Keep errors array (don't set to None for failed results)
 
     print(f"[{url_id}] Failed after {time.time() - start_time:.2f}s")
 
-    # Return result (Tinybird batching handled by process_batch)
-    return result.to_dict()
+    # Return result with initial data merged (initial data takes priority)
+    return merge_with_initial_data(result.to_dict(), initial_data)
 
 
 # =============================================================================
@@ -1340,12 +1996,23 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     """Process batch with concurrency control via semaphore."""
     config = get_config()
     primary = get_primary_scraper()
+    retries_config = get_retries_config()
 
-    # Build priority string based on primary
+    # Build priority string based on enabled methods
+    enabled_methods = [(m, r) for m, r in [
+        (METHOD_FIRECRAWL, retries_config[METHOD_FIRECRAWL]),
+        (METHOD_BRIGHTDATA, retries_config[METHOD_BRIGHTDATA]),
+        (METHOD_PLAYWRIGHT, retries_config[METHOD_PLAYWRIGHT]),
+    ] if r > 0]
+
+    # Reorder based on primary
     if primary == PRIMARY_BRIGHTDATA:
-        priority_str = "Bright Data -> Firecrawl -> Playwright"
+        order = [METHOD_BRIGHTDATA, METHOD_FIRECRAWL, METHOD_PLAYWRIGHT]
     else:
-        priority_str = "Firecrawl -> Bright Data -> Playwright"
+        order = [METHOD_FIRECRAWL, METHOD_BRIGHTDATA, METHOD_PLAYWRIGHT]
+
+    ordered_enabled = [(m, retries_config[m]) for m in order if retries_config[m] > 0]
+    priority_str = " -> ".join(f"{m.title()}({r})" for m, r in ordered_enabled) if ordered_enabled else "NONE"
 
     print(f"\n{'='*70}")
     print(f"MODAL WEB SCRAPER v3.2 - OPTIMIZED BATCH")
@@ -1359,6 +2026,11 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     print(f"  Max Inputs/Container: {config['max_inputs']}")
     print(f"  Theoretical Capacity: {config['max_containers'] * config['max_inputs']}")
     print(f"{'='*70}")
+    print(f"METHOD RETRIES (0 = disabled):")
+    print(f"  Firecrawl:   {retries_config[METHOD_FIRECRAWL]} {'(disabled)' if retries_config[METHOD_FIRECRAWL] == 0 else ''}")
+    print(f"  Bright Data: {retries_config[METHOD_BRIGHTDATA]} {'(disabled)' if retries_config[METHOD_BRIGHTDATA] == 0 else ''}")
+    print(f"  Playwright:  {retries_config[METHOD_PLAYWRIGHT]} {'(disabled)' if retries_config[METHOD_PLAYWRIGHT] == 0 else ''}")
+    print(f"{'='*70}")
     print(f"Tinybird Batching: {TINYBIRD_BATCH_SIZE} records/batch, {TINYBIRD_FLUSH_TIMEOUT}s timeout")
     print(f"{'='*70}")
     print(f"Scraping Priority: {priority_str}")
@@ -1369,14 +2041,51 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     # Use semaphore to control concurrency (respects API limits)
     semaphore = asyncio.Semaphore(config["max_concurrency"])
 
-    async def scrape_with_semaphore(url_id: str, url: str, method: Optional[str] = None) -> dict:
+    async def scrape_with_semaphore(url_id: str, url: str, method: Optional[str] = None, initial_data: Optional[dict] = None) -> dict:
         async with semaphore:
-            return await scrape_url.remote.aio(url_id, url, method)
+            return await scrape_url.remote.aio(url_id, url, method, initial_data)
 
-    # Create all tasks (pass method if specified in the URL item)
+    # Pre-process items: extract URL, method, and initial_data from each item
+    # This allows flexible input format (url or productUrl for the URL to scrape)
+    processed_items = []
+    for item in urls_data:
+        # Extract URL (try 'url' first, then 'productUrl')
+        url = extract_url_from_item(item)
+        if not url:
+            print(f"[WARNING] Skipping item without URL: {item.get('urlId', 'unknown')}")
+            continue
+
+        # Get urlId (required)
+        url_id = item.get("urlId")
+        if not url_id:
+            print(f"[WARNING] Skipping item without urlId: {url[:50]}...")
+            continue
+
+        # Extract method preference
+        method = item.get("method")
+
+        # Extract initial data (fields that will override scraped data)
+        initial_data = extract_initial_data(item)
+
+        processed_items.append({
+            "url_id": url_id,
+            "url": url,
+            "method": method,
+            "initial_data": initial_data,
+            "original_item": item,  # Keep reference for error handling
+        })
+
+    print(f"Processed {len(processed_items)} valid items from {len(urls_data)} input items")
+
+    # Create all tasks
     tasks = [
-        scrape_with_semaphore(item["urlId"], item["url"], item.get("method"))
-        for item in urls_data
+        scrape_with_semaphore(
+            item["url_id"],
+            item["url"],
+            item["method"],
+            item["initial_data"]
+        )
+        for item in processed_items
     ]
 
     # Run all tasks concurrently (semaphore limits actual concurrency)
@@ -1386,13 +2095,18 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     processed_results = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
-            processed_results.append({
-                "urlId": urls_data[i]["urlId"],
-                "productUrl": urls_data[i]["url"],
+            # Build error result with initial_data merged
+            item = processed_items[i]
+            error_result = {
+                "urlId": item["url_id"],
+                "productUrl": item["url"],
                 "status": "error",
                 "errorMessage": str(r)[:200],
                 "scrapedAt": int(time.time() * 1000)
-            })
+            }
+            # Merge with initial_data so metadata is preserved even on errors
+            error_result = merge_with_initial_data(error_result, item["initial_data"])
+            processed_results.append(error_result)
         else:
             processed_results.append(r)
 
@@ -1447,14 +2161,40 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
 
 @app.local_entrypoint()
 def main(input_file: str = None, input_json: str = None):
-    """Main entrypoint."""
+    """
+    Main entrypoint.
+
+    Accepts JSON input with flexible field names:
+    - URL can be specified as 'url' or 'productUrl'
+    - Method can be specified as 'method' (firecrawl, brightdata, playwright)
+    - Additional fields (companyName, alertId, productTitle, seller, etc.)
+      will override any scraped data in the final output
+
+    Example input:
+    {
+        "urls": [
+            {
+                "urlId": "test_001",
+                "url": "https://www.amazon.com.br/dp/B0BDHWDR12",
+                "companyName": "My Company",
+                "alertId": "alert_123",
+                "method": "brightdata"
+            }
+        ]
+    }
+    """
     if input_file:
         with open(input_file, 'r') as f:
             data = json.load(f)
     elif input_json:
         data = json.loads(input_json)
     else:
-        data = {"urls": [{"urlId": "test_001", "url": "https://www.amazon.com.br/dp/B0BDHWDR12"}]}
+        # Default test data with example of initial data fields
+        data = {"urls": [{
+            "urlId": "test_001",
+            "url": "https://www.amazon.com.br/dp/B0BDHWDR12",
+            "companyName": "Test Company"  # This will override any scraped company name
+        }]}
 
     urls_data = data.get("urls", [])
     if not urls_data:
@@ -1463,7 +2203,19 @@ def main(input_file: str = None, input_json: str = None):
 
     print(f"\n{'='*60}")
     print(f"INPUT: {len(urls_data)} URLs")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Show sample of input data with initial fields
+    for i, item in enumerate(urls_data[:3]):
+        url = extract_url_from_item(item)
+        initial_data = extract_initial_data(item)
+        override_fields = [k for k, v in initial_data.items() if v is not None and k != "urlId"]
+        print(f"  [{i+1}] {item.get('urlId', 'unknown')}: {url[:50] if url else 'NO URL'}...")
+        if override_fields:
+            print(f"      Override fields: {', '.join(override_fields)}")
+    if len(urls_data) > 3:
+        print(f"  ... and {len(urls_data) - 3} more")
+    print()
 
     # Run async batch
     results = process_batch.remote(urls_data)
