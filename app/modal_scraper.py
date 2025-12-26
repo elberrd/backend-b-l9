@@ -22,6 +22,7 @@ Environment Variables:
 - MAX_CONCURRENCY: Override max concurrent scrapes
 - MAX_CONTAINERS: Override max containers
 - MAX_INPUTS: Override max inputs per container
+- TINYBIRD_TOKEN: Token for Tinybird Events API (sends scrape results to database)
 
 Usage:
     modal run app/modal_scraper.py
@@ -83,6 +84,10 @@ METHOD_PLAYWRIGHT = "playwright"
 # Primary scraper options
 PRIMARY_FIRECRAWL = "firecrawl"
 PRIMARY_BRIGHTDATA = "brightdata"
+
+# Tinybird configuration
+TINYBIRD_HOST = "https://api.us-east.tinybird.co"
+TINYBIRD_DATASOURCE = "product_scrapes"
 
 # =============================================================================
 # Optimal Configuration by Primary Scraper
@@ -364,6 +369,106 @@ def delete_from_r2_sync(screenshot_url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# =============================================================================
+# Tinybird Events API
+# =============================================================================
+
+async def send_to_tinybird_async(scrape_result: dict) -> Tuple[bool, Optional[str]]:
+    """
+    Send scrape result to Tinybird Events API.
+
+    Uses NDJSON format for efficient ingestion.
+    Returns (success, error_message).
+    """
+    import httpx
+
+    token = os.environ.get("TINYBIRD_TOKEN")
+    if not token:
+        return False, "TINYBIRD_TOKEN not configured"
+
+    try:
+        # Prepare data for Tinybird
+        # Convert scrapedAt from milliseconds to ISO format for DateTime64
+        scraped_at_ms = scrape_result.get("scrapedAt", int(time.time() * 1000))
+        scraped_at_iso = datetime.utcfromtimestamp(scraped_at_ms / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        # Build the record with proper type conversions
+        record = {
+            "urlId": scrape_result.get("urlId", ""),
+            "productUrl": scrape_result.get("productUrl", ""),
+            "status": scrape_result.get("status", "error"),
+            "scrapedAt": scraped_at_iso,
+            "errorMessage": scrape_result.get("errorMessage"),
+            "screenshotUrl": scrape_result.get("screenshotUrl"),
+            "productTitle": scrape_result.get("productTitle"),
+            "productName": scrape_result.get("productTitle"),  # Alias for productTitle
+            "brand": scrape_result.get("brand"),
+            "brandName": scrape_result.get("brand"),  # Alias for brand
+            "currentPrice": scrape_result.get("currentPrice"),
+            "originalPrice": scrape_result.get("originalPrice"),
+            "discountPercentage": scrape_result.get("discountPercentage"),
+            "currency": scrape_result.get("currency"),
+            # Convert boolean to int for UInt8
+            "availability": 1 if scrape_result.get("availability") else (0 if scrape_result.get("availability") is False else None),
+            "imageUrl": scrape_result.get("imageUrl"),
+            "seller": scrape_result.get("seller"),
+            "sellerName": scrape_result.get("seller"),  # Alias for seller
+            "shippingInfo": scrape_result.get("shippingInfo"),
+            "shippingCost": scrape_result.get("shippingCost"),
+            "deliveryTime": scrape_result.get("deliveryTime"),
+            # Convert review_score to string (Gemini may return int or string)
+            "review_score": str(scrape_result.get("review_score")) if scrape_result.get("review_score") is not None else None,
+            "installmentOptions": scrape_result.get("installmentOptions"),
+            # Convert boolean to int for UInt8
+            "kit": 1 if scrape_result.get("kit") else (0 if scrape_result.get("kit") is False else None),
+            "unitMeasurement": scrape_result.get("unitMeasurement"),
+            "outOfStockReason": scrape_result.get("outOfStockReason"),
+            "marketplaceWebsite": scrape_result.get("marketplaceWebsite"),
+            "sku": scrape_result.get("sku"),
+            "ean": scrape_result.get("ean"),
+            "stockQuantity": scrape_result.get("stockQuantity"),
+            "otherPaymentMethods": scrape_result.get("otherPaymentMethods"),
+            "promotionDetails": scrape_result.get("promotionDetails"),
+            "method": scrape_result.get("method"),
+            # Convert arrays to JSON strings
+            "attempts": json.dumps(scrape_result.get("attempts")) if scrape_result.get("attempts") else None,
+            "errors": json.dumps(scrape_result.get("errors")) if scrape_result.get("errors") else None,
+        }
+
+        # Remove None values to reduce payload size
+        record = {k: v for k, v in record.items() if v is not None}
+
+        # Convert to NDJSON (single line JSON)
+        ndjson_data = json.dumps(record, ensure_ascii=False)
+
+        url_id = scrape_result.get("urlId", "unknown")
+        print(f"[{url_id}] Tinybird: Sending data...")
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            response = await client.post(
+                f"{TINYBIRD_HOST}/v0/events?name={TINYBIRD_DATASOURCE}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                content=ndjson_data,
+            )
+
+            if response.status_code in (200, 202):
+                result = response.json()
+                print(f"[{url_id}] Tinybird: Success - {result.get('successful_rows', 0)} rows ingested")
+                return True, None
+            else:
+                error_msg = f"Tinybird API error: {response.status_code} - {response.text[:200]}"
+                print(f"[{url_id}] Tinybird: {error_msg}")
+                return False, error_msg
+
+    except httpx.TimeoutException:
+        return False, "Tinybird timeout"
+    except Exception as e:
+        return False, f"Tinybird error: {str(e)[:200]}"
 
 
 # =============================================================================
@@ -981,7 +1086,15 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
                 setattr(result, field, product_data.get(field))
 
             print(f"[{url_id}] Completed in {time.time() - start_time:.2f}s")
-            return result.to_dict()
+
+            # Send to Tinybird (non-blocking, errors logged but don't fail the scrape)
+            result_dict = result.to_dict()
+            try:
+                await send_to_tinybird_async(result_dict)
+            except Exception as e:
+                print(f"[{url_id}] Tinybird send error (non-fatal): {str(e)[:100]}")
+
+            return result_dict
 
         else:
             print(f"[{url_id}] {method_name}: Extraction failed - {extraction_error}")
@@ -1006,7 +1119,15 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
     # Keep errors array (don't set to None for failed results)
 
     print(f"[{url_id}] Failed after {time.time() - start_time:.2f}s")
-    return result.to_dict()
+
+    # Send to Tinybird (non-blocking, errors logged but don't fail the scrape)
+    result_dict = result.to_dict()
+    try:
+        await send_to_tinybird_async(result_dict)
+    except Exception as e:
+        print(f"[{url_id}] Tinybird send error (non-fatal): {str(e)[:100]}")
+
+    return result_dict
 
 
 # =============================================================================
