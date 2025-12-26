@@ -126,6 +126,17 @@ class AttemptResult:
 
 
 @dataclass
+class AttemptError:
+    """Error from a single scraping attempt."""
+    method: str
+    operation: str
+    error: str
+
+    def to_dict(self) -> dict:
+        return {"method": self.method, "operation": self.operation, "error": self.error}
+
+
+@dataclass
 class ScrapeResult:
     """Result of scraping a single URL."""
     urlId: str
@@ -150,6 +161,7 @@ class ScrapeResult:
     installmentOptions: Optional[str] = None
     method: Optional[str] = None
     attempts: Optional[List[str]] = None
+    errors: Optional[List[dict]] = None  # Array of errors from failed attempts
 
     def to_dict(self) -> dict:
         result = {
@@ -162,7 +174,8 @@ class ScrapeResult:
             "errorMessage", "screenshotUrl", "productTitle", "brand",
             "currentPrice", "originalPrice", "discountPercentage", "currency",
             "availability", "imageUrl", "seller", "shippingInfo", "shippingCost",
-            "deliveryTime", "review_score", "installmentOptions", "method", "attempts"
+            "deliveryTime", "review_score", "installmentOptions", "method", "attempts",
+            "errors"
         ]:
             value = getattr(self, field_name)
             if value is not None:
@@ -359,9 +372,9 @@ async def attempt_firecrawl_async(url: str, url_id: str) -> AttemptResult:
         print(f"[{url_id}] Firecrawl: Starting async scrape...")
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
-            # Call Firecrawl API
+            # Call Firecrawl API v2
             response = await client.post(
-                "https://api.firecrawl.dev/v1/scrape",
+                "https://api.firecrawl.dev/v2/scrape",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
@@ -626,18 +639,30 @@ async def extract_product_data_async(html_content: str, url: str, url_id: str) -
             http_options=types.HttpOptions(api_version='v1beta')
         )
 
-        prompt = f"""Analyze this HTML from a product page and extract info.
+        prompt = f"""Analyze this HTML content from a product page and extract product information.
 
 URL: {url}
 
-HTML:
+HTML Content:
 {cleaned_html[:50000]}
 
-Return JSON with: productTitle, brand, currentPrice (number), originalPrice (number),
-discountPercentage (number), currency, availability (bool), seller, shippingInfo,
-shippingCost (number), deliveryTime, installmentOptions, imageUrl, review_score.
+Extract and return a JSON object with these fields:
+- productTitle: Product name/title
+- brand: Brand name if found
+- currentPrice: Current/discounted price as a number (the price the customer pays now)
+- originalPrice: Original/regular price as a number (before discount, if any)
+- discountPercentage: Discount percentage if any, as a number
+- currency: Currency symbol (e.g., "R$", "$", "€")
+- availability: Boolean indicating if product is in stock
+- seller: Seller name if found
+- shippingInfo: Shipping information text
+- shippingCost: Shipping cost as a number
+- deliveryTime: Estimated delivery time
+- installmentOptions: Payment installment info (e.g., "10x de R$ 15,90")
+- imageUrl: Main product image URL
+- review_score: Review rating if found
 
-Return ONLY valid JSON. Omit fields not found."""
+Return ONLY valid JSON, no markdown or explanation. Omit fields not found."""
 
         # Use async generate
         response = await client.aio.models.generate_content(
@@ -652,12 +677,17 @@ Return ONLY valid JSON. Omit fields not found."""
 
         data = json.loads(text)
 
+        # Debug: show what Gemini extracted
+        print(f"[{url_id}] Gemini extracted: {json.dumps(data, ensure_ascii=False)[:500]}")
+
         if not data.get("currentPrice") and not data.get("originalPrice"):
-            return None, "Could not extract price"
+            # Return partial data with error for debugging
+            return None, f"Could not extract price. Got: {json.dumps(data, ensure_ascii=False)[:200]}"
 
         return data, None
 
     except json.JSONDecodeError as e:
+        print(f"[{url_id}] Gemini raw response: {text[:500] if 'text' in dir() else 'N/A'}")
         return None, f"JSON error: {str(e)[:100]}"
     except Exception as e:
         return None, f"Extraction error: {str(e)[:200]}"
@@ -673,6 +703,31 @@ def get_primary_scraper() -> str:
     if primary in (PRIMARY_FIRECRAWL, PRIMARY_BRIGHTDATA):
         return primary
     return PRIMARY_FIRECRAWL
+
+
+def parse_method_preference(method: Optional[str]) -> Optional[str]:
+    """
+    Parse user-specified method preference.
+
+    Returns normalized method name or None if invalid/not specified.
+    """
+    if not method:
+        return None
+
+    normalized = method.lower().strip().replace(" ", "").replace("_", "").replace("-", "")
+
+    # Map common variations to valid methods
+    method_mapping = {
+        "firecrawl": METHOD_FIRECRAWL,
+        "fc": METHOD_FIRECRAWL,
+        "brightdata": METHOD_BRIGHTDATA,
+        "bd": METHOD_BRIGHTDATA,
+        "playwright": METHOD_PLAYWRIGHT,
+        "playwrite": METHOD_PLAYWRIGHT,
+        "pw": METHOD_PLAYWRIGHT,
+    }
+
+    return method_mapping.get(normalized)
 
 
 def get_config() -> dict:
@@ -749,55 +804,114 @@ def get_max_concurrency() -> int:
     secrets=[modal.Secret.from_name("bausch")],
 )
 @modal.concurrent(max_inputs=20)  # Max possible - actual controlled by semaphore
-async def scrape_url(url_id: str, url: str) -> dict:
+async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dict:
     """
     Scrape a single URL with 3-tier async fallback system.
+
+    Args:
+        url_id: Unique identifier for this URL
+        url: The URL to scrape
+        method: Optional preferred method to try first (firecrawl, brightdata, playwright)
     """
     config = get_config()
     primary = get_primary_scraper()
+
+    # Check if user specified a method preference
+    preferred_method = parse_method_preference(method)
+
     print(f"\n{'='*60}")
     print(f"[{url_id}] Starting scrape: {url[:60]}...")
+    if preferred_method:
+        print(f"[{url_id}] User preferred: {preferred_method.upper()}")
     print(f"[{url_id}] Primary: {primary.upper()} | Concurrency: {config['max_concurrency']}")
     print(f"{'='*60}")
 
     start_time = time.time()
     result = ScrapeResult(
         urlId=url_id, url=url, status="error",
-        scrapedAt=int(time.time() * 1000), attempts=[]
+        scrapedAt=int(time.time() * 1000), attempts=[], errors=[]
     )
 
     last_screenshot_url = None
     last_error = None
 
-    # Build attempt order based on PRIMARY_SCRAPER
-    primary = get_primary_scraper()
-    if primary == PRIMARY_BRIGHTDATA:
-        attempt_methods = [
-            ("Bright Data", attempt_brightdata_async),
-            ("Firecrawl", attempt_firecrawl_async),
-            ("Playwright", attempt_playwright_async),
-        ]
+    # Define all methods with their functions
+    all_methods = {
+        METHOD_FIRECRAWL: ("Firecrawl", attempt_firecrawl_async),
+        METHOD_BRIGHTDATA: ("Bright Data", attempt_brightdata_async),
+        METHOD_PLAYWRIGHT: ("Playwright", attempt_playwright_async),
+    }
+
+    # Build attempt order based on preference or PRIMARY_SCRAPER
+    if preferred_method and preferred_method in all_methods:
+        # User specified a method - put it first, then others in default order
+        attempt_order = [preferred_method]
+        default_order = [METHOD_FIRECRAWL, METHOD_BRIGHTDATA, METHOD_PLAYWRIGHT]
+        for m in default_order:
+            if m != preferred_method:
+                attempt_order.append(m)
+    elif primary == PRIMARY_BRIGHTDATA:
+        attempt_order = [METHOD_BRIGHTDATA, METHOD_FIRECRAWL, METHOD_PLAYWRIGHT]
     else:
-        attempt_methods = [
-            ("Firecrawl", attempt_firecrawl_async),
-            ("Bright Data", attempt_brightdata_async),
-            ("Playwright", attempt_playwright_async),
-        ]
+        attempt_order = [METHOD_FIRECRAWL, METHOD_BRIGHTDATA, METHOD_PLAYWRIGHT]
 
-    for attempt_num, (method_name, attempt_func) in enumerate(attempt_methods, 1):
-        print(f"\n[{url_id}] === ATTEMPT {attempt_num}/3: {method_name} ===")
-        result.attempts.append(method_name)
+    attempt_methods = [(all_methods[m][0], all_methods[m][1], m) for m in attempt_order]
 
-        try:
-            attempt_result = await attempt_func(url, url_id)
-        except Exception as e:
-            print(f"[{url_id}] {method_name} exception: {str(e)[:100]}")
-            last_error = f"{method_name} exception: {str(e)[:200]}"
-            continue
+    # Retry configuration per method
+    # Firecrawl: 1 attempt (often blocked, no point retrying)
+    # Bright Data: 3 attempts (reliable but sometimes needs retries)
+    # Playwright: 2 attempts (local browser, worth retrying)
+    RETRIES_CONFIG = {
+        METHOD_FIRECRAWL: 1,
+        METHOD_BRIGHTDATA: 3,
+        METHOD_PLAYWRIGHT: 2,
+    }
 
-        if not attempt_result.success:
-            print(f"[{url_id}] {method_name} failed: {attempt_result.error}")
-            last_error = attempt_result.error
+    for attempt_num, (method_name, attempt_func, method_key) in enumerate(attempt_methods, 1):
+        # Determine how many retries this method gets
+        max_retries = RETRIES_CONFIG.get(method_key, 1)
+
+        attempt_result = None
+        method_succeeded = False
+
+        for retry in range(max_retries):
+            retry_suffix = f" (attempt {retry + 1}/{max_retries})" if max_retries > 1 else ""
+            print(f"\n[{url_id}] === METHOD {attempt_num}/3: {method_name}{retry_suffix} ===")
+
+            if retry == 0:
+                result.attempts.append(method_name)
+            else:
+                result.attempts.append(f"{method_name} (retry {retry})")
+
+            try:
+                attempt_result = await attempt_func(url, url_id)
+            except Exception as e:
+                error_msg = f"{method_name} exception: {str(e)[:200]}"
+                print(f"[{url_id}] {method_name} exception: {str(e)[:100]}")
+                result.errors.append({
+                    "method": method_key,
+                    "operation": "scrape",
+                    "error": error_msg
+                })
+                last_error = error_msg
+                continue  # Try next retry if available
+
+            if not attempt_result.success:
+                print(f"[{url_id}] {method_name} failed: {attempt_result.error}")
+                result.errors.append({
+                    "method": method_key,
+                    "operation": "scrape",
+                    "error": attempt_result.error or "Unknown error"
+                })
+                last_error = attempt_result.error
+                continue  # Try next retry if available
+
+            # Success! Break out of retry loop
+            method_succeeded = True
+            break
+
+        # If all retries failed, move to next method
+        if not method_succeeded:
             continue
 
         # Process screenshot
@@ -812,8 +926,18 @@ async def scrape_url(url_id: str, url: str) -> dict:
                     last_screenshot_url = screenshot_url
                 elif err:
                     print(f"[{url_id}] R2 error: {err}")
+                    result.errors.append({
+                        "method": "r2",
+                        "operation": "upload",
+                        "error": err
+                    })
             except Exception as e:
                 print(f"[{url_id}] Screenshot error: {str(e)[:100]}")
+                result.errors.append({
+                    "method": method_key,
+                    "operation": "screenshot_process",
+                    "error": str(e)[:200]
+                })
 
         # Extract data
         product_data, extraction_error = await extract_product_data_async(
@@ -826,6 +950,9 @@ async def scrape_url(url_id: str, url: str) -> dict:
             result.status = "completed"
             result.method = attempt_result.method
             result.screenshotUrl = screenshot_url
+            # Only include errors if there were any
+            if not result.errors:
+                result.errors = None
             for field in ["productTitle", "brand", "currentPrice", "originalPrice",
                           "discountPercentage", "currency", "availability", "imageUrl",
                           "seller", "shippingInfo", "shippingCost", "deliveryTime",
@@ -837,18 +964,25 @@ async def scrape_url(url_id: str, url: str) -> dict:
 
         else:
             print(f"[{url_id}] {method_name}: Extraction failed - {extraction_error}")
-            last_error = extraction_error or "Could not extract price"
-
+            error_entry = {
+                "method": "gemini",
+                "operation": "extraction",
+                "error": extraction_error or "Could not extract price"
+            }
+            # Keep screenshot URL in error for debugging (don't delete)
             if screenshot_url:
-                print(f"[{url_id}] Deleting failed screenshot...")
-                await delete_from_r2_async(screenshot_url)
-                last_screenshot_url = None
+                error_entry["screenshotUrl"] = screenshot_url
+                last_screenshot_url = screenshot_url
+                print(f"[{url_id}] Keeping screenshot for debugging: {screenshot_url}")
+            result.errors.append(error_entry)
+            last_error = extraction_error or "Could not extract price"
 
     # All failed
     print(f"\n[{url_id}] ALL 3 ATTEMPTS FAILED")
     result.status = "error"
     result.errorMessage = last_error or "All methods failed"
     result.screenshotUrl = last_screenshot_url
+    # Keep errors array (don't set to None for failed results)
 
     print(f"[{url_id}] Failed after {time.time() - start_time:.2f}s")
     return result.to_dict()
@@ -894,13 +1028,13 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     # Use semaphore to control concurrency (respects API limits)
     semaphore = asyncio.Semaphore(config["max_concurrency"])
 
-    async def scrape_with_semaphore(url_id: str, url: str) -> dict:
+    async def scrape_with_semaphore(url_id: str, url: str, method: Optional[str] = None) -> dict:
         async with semaphore:
-            return await scrape_url.remote.aio(url_id, url)
+            return await scrape_url.remote.aio(url_id, url, method)
 
-    # Create all tasks
+    # Create all tasks (pass method if specified in the URL item)
     tasks = [
-        scrape_with_semaphore(item["urlId"], item["url"])
+        scrape_with_semaphore(item["urlId"], item["url"], item.get("method"))
         for item in urls_data
     ]
 
