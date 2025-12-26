@@ -32,8 +32,10 @@ Usage:
 
 import modal
 import asyncio
+import gzip
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -88,6 +90,14 @@ PRIMARY_BRIGHTDATA = "brightdata"
 # Tinybird configuration
 TINYBIRD_HOST = "https://api.us-east.tinybird.co"
 TINYBIRD_DATASOURCE = "product_scrapes"
+
+# Tinybird Batcher configuration
+TINYBIRD_BATCH_SIZE = 10          # Flush every N records
+TINYBIRD_FLUSH_TIMEOUT = 30.0     # Flush after N seconds even if batch not full
+TINYBIRD_MAX_RETRIES = 3          # Max retry attempts per batch
+TINYBIRD_BASE_DELAY = 1.0         # Initial retry delay (seconds)
+TINYBIRD_MAX_DELAY = 10.0         # Maximum retry delay (seconds)
+TINYBIRD_REQUEST_TIMEOUT = 30.0   # HTTP request timeout
 
 # =============================================================================
 # Optimal Configuration by Primary Scraper
@@ -372,29 +382,106 @@ def delete_from_r2_sync(screenshot_url: str) -> bool:
 
 
 # =============================================================================
-# Tinybird Events API
+# Tinybird Batcher (Resilient Batch Ingestion)
 # =============================================================================
 
-async def send_to_tinybird_async(scrape_result: dict) -> Tuple[bool, Optional[str]]:
+class TinybirdBatcher:
     """
-    Send scrape result to Tinybird Events API.
+    Resilient batch sender for Tinybird Events API.
 
-    Uses NDJSON format for efficient ingestion.
-    Returns (success, error_message).
+    Features:
+    - Batches records (default: 10) before sending
+    - Auto-flush on timeout (default: 30s) even if batch not full
+    - Exponential backoff with jitter on failures
+    - Gzip compression for efficiency
+    - Thread-safe async operations
+
+    Usage:
+        async with TinybirdBatcher() as batcher:
+            await batcher.add(record1)
+            await batcher.add(record2)
+            # Auto-flushes when batch_size reached or timeout expires
+        # Remaining records flushed on context exit
     """
-    import httpx
 
-    token = os.environ.get("TINYBIRD_TOKEN")
-    if not token:
-        return False, "TINYBIRD_TOKEN not configured"
+    def __init__(
+        self,
+        batch_size: int = TINYBIRD_BATCH_SIZE,
+        flush_timeout: float = TINYBIRD_FLUSH_TIMEOUT,
+        max_retries: int = TINYBIRD_MAX_RETRIES,
+        base_delay: float = TINYBIRD_BASE_DELAY,
+        max_delay: float = TINYBIRD_MAX_DELAY,
+    ):
+        self.batch_size = batch_size
+        self.flush_timeout = flush_timeout
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
 
-    try:
-        # Prepare data for Tinybird
-        # Convert scrapedAt from milliseconds to ISO format for DateTime64
+        self._buffer: List[dict] = []
+        self._lock = asyncio.Lock()
+        self._flush_task: Optional[asyncio.Task] = None
+        self._last_add_time: float = 0
+        self._client = None
+
+        # Metrics
+        self._total_records = 0
+        self._total_batches = 0
+        self._failed_batches = 0
+        self._total_retries = 0
+
+    async def __aenter__(self):
+        """Initialize HTTP client on context enter."""
+        import httpx
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(TINYBIRD_REQUEST_TIMEOUT))
+        self._start_flush_timer()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Flush remaining records and cleanup on context exit."""
+        # Cancel timer
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final flush
+        await self.flush()
+
+        # Close client
+        if self._client:
+            await self._client.aclose()
+
+        # Print metrics
+        self._print_metrics()
+
+        return False
+
+    def _start_flush_timer(self):
+        """Start or restart the flush timeout timer."""
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        self._flush_task = asyncio.create_task(self._flush_timer())
+
+    async def _flush_timer(self):
+        """Background task that flushes on timeout."""
+        try:
+            while True:
+                await asyncio.sleep(self.flush_timeout)
+                async with self._lock:
+                    if self._buffer and (time.time() - self._last_add_time) >= self.flush_timeout:
+                        print(f"[TinybirdBatcher] Timeout flush: {len(self._buffer)} records")
+                        await self._flush_internal()
+        except asyncio.CancelledError:
+            pass
+
+    def _prepare_record(self, scrape_result: dict) -> dict:
+        """Convert scrape result to Tinybird-compatible record."""
         scraped_at_ms = scrape_result.get("scrapedAt", int(time.time() * 1000))
         scraped_at_iso = datetime.utcfromtimestamp(scraped_at_ms / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
-        # Build the record with proper type conversions
         record = {
             "urlId": scrape_result.get("urlId", ""),
             "productUrl": scrape_result.get("productUrl", ""),
@@ -403,25 +490,22 @@ async def send_to_tinybird_async(scrape_result: dict) -> Tuple[bool, Optional[st
             "errorMessage": scrape_result.get("errorMessage"),
             "screenshotUrl": scrape_result.get("screenshotUrl"),
             "productTitle": scrape_result.get("productTitle"),
-            "productName": scrape_result.get("productTitle"),  # Alias for productTitle
+            "productName": scrape_result.get("productTitle"),
             "brand": scrape_result.get("brand"),
-            "brandName": scrape_result.get("brand"),  # Alias for brand
+            "brandName": scrape_result.get("brand"),
             "currentPrice": scrape_result.get("currentPrice"),
             "originalPrice": scrape_result.get("originalPrice"),
             "discountPercentage": scrape_result.get("discountPercentage"),
             "currency": scrape_result.get("currency"),
-            # Convert boolean to int for UInt8
             "availability": 1 if scrape_result.get("availability") else (0 if scrape_result.get("availability") is False else None),
             "imageUrl": scrape_result.get("imageUrl"),
             "seller": scrape_result.get("seller"),
-            "sellerName": scrape_result.get("seller"),  # Alias for seller
+            "sellerName": scrape_result.get("seller"),
             "shippingInfo": scrape_result.get("shippingInfo"),
             "shippingCost": scrape_result.get("shippingCost"),
             "deliveryTime": scrape_result.get("deliveryTime"),
-            # Convert review_score to string (Gemini may return int or string)
             "review_score": str(scrape_result.get("review_score")) if scrape_result.get("review_score") is not None else None,
             "installmentOptions": scrape_result.get("installmentOptions"),
-            # Convert boolean to int for UInt8
             "kit": 1 if scrape_result.get("kit") else (0 if scrape_result.get("kit") is False else None),
             "unitMeasurement": scrape_result.get("unitMeasurement"),
             "outOfStockReason": scrape_result.get("outOfStockReason"),
@@ -432,43 +516,146 @@ async def send_to_tinybird_async(scrape_result: dict) -> Tuple[bool, Optional[st
             "otherPaymentMethods": scrape_result.get("otherPaymentMethods"),
             "promotionDetails": scrape_result.get("promotionDetails"),
             "method": scrape_result.get("method"),
-            # Convert arrays to JSON strings
             "attempts": json.dumps(scrape_result.get("attempts")) if scrape_result.get("attempts") else None,
             "errors": json.dumps(scrape_result.get("errors")) if scrape_result.get("errors") else None,
         }
 
-        # Remove None values to reduce payload size
-        record = {k: v for k, v in record.items() if v is not None}
+        return {k: v for k, v in record.items() if v is not None}
 
-        # Convert to NDJSON (single line JSON)
-        ndjson_data = json.dumps(record, ensure_ascii=False)
+    async def add(self, scrape_result: dict):
+        """Add a scrape result to the batch buffer."""
+        record = self._prepare_record(scrape_result)
 
-        url_id = scrape_result.get("urlId", "unknown")
-        print(f"[{url_id}] Tinybird: Sending data...")
+        async with self._lock:
+            self._buffer.append(record)
+            self._last_add_time = time.time()
+            self._total_records += 1
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            response = await client.post(
-                f"{TINYBIRD_HOST}/v0/events?name={TINYBIRD_DATASOURCE}",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                content=ndjson_data,
-            )
+            url_id = scrape_result.get("urlId", "unknown")
+            print(f"[{url_id}] TinybirdBatcher: Queued ({len(self._buffer)}/{self.batch_size})")
 
-            if response.status_code in (200, 202):
-                result = response.json()
-                print(f"[{url_id}] Tinybird: Success - {result.get('successful_rows', 0)} rows ingested")
-                return True, None
-            else:
-                error_msg = f"Tinybird API error: {response.status_code} - {response.text[:200]}"
-                print(f"[{url_id}] Tinybird: {error_msg}")
-                return False, error_msg
+            if len(self._buffer) >= self.batch_size:
+                print(f"[TinybirdBatcher] Batch full: flushing {len(self._buffer)} records")
+                await self._flush_internal()
 
-    except httpx.TimeoutException:
-        return False, "Tinybird timeout"
-    except Exception as e:
-        return False, f"Tinybird error: {str(e)[:200]}"
+    async def flush(self):
+        """Force flush all buffered records."""
+        async with self._lock:
+            if self._buffer:
+                await self._flush_internal()
+
+    async def _flush_internal(self):
+        """Internal flush - must be called with lock held."""
+        if not self._buffer:
+            return
+
+        token = os.environ.get("TINYBIRD_TOKEN")
+        if not token:
+            print("[TinybirdBatcher] ERROR: TINYBIRD_TOKEN not configured - discarding batch")
+            self._buffer.clear()
+            return
+
+        batch = self._buffer.copy()
+        self._buffer.clear()
+
+        success = await self._send_batch_with_retry(batch, token)
+
+        self._total_batches += 1
+        if not success:
+            self._failed_batches += 1
+
+    async def _send_batch_with_retry(self, batch: List[dict], token: str) -> bool:
+        """Send batch with exponential backoff retry."""
+        import httpx
+
+        # Prepare NDJSON payload
+        ndjson_lines = [json.dumps(record, ensure_ascii=False) for record in batch]
+        ndjson_data = "\n".join(ndjson_lines)
+
+        # Gzip compress
+        compressed_data = gzip.compress(ndjson_data.encode('utf-8'))
+        compression_ratio = (1 - len(compressed_data) / len(ndjson_data.encode('utf-8'))) * 100
+
+        batch_id = f"batch_{int(time.time())}_{len(batch)}"
+        url_ids = [r.get("urlId", "?") for r in batch[:3]]
+        url_ids_str = ", ".join(url_ids) + ("..." if len(batch) > 3 else "")
+
+        print(f"[TinybirdBatcher] Sending {batch_id}: {len(batch)} records, "
+              f"{len(compressed_data):,} bytes (gzip: {compression_ratio:.1f}% reduction)")
+        print(f"[TinybirdBatcher] URLs: [{url_ids_str}]")
+
+        last_error = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = await self._client.post(
+                    f"{TINYBIRD_HOST}/v0/events?name={TINYBIRD_DATASOURCE}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "gzip",
+                    },
+                    content=compressed_data,
+                )
+
+                if response.status_code in (200, 202):
+                    result = response.json()
+                    rows = result.get('successful_rows', 0)
+                    quarantined = result.get('quarantined_rows', 0)
+                    print(f"[TinybirdBatcher] {batch_id} SUCCESS: {rows} rows ingested"
+                          + (f", {quarantined} quarantined" if quarantined else ""))
+                    return True
+
+                elif response.status_code == 429:
+                    # Rate limited - use Retry-After header if available
+                    retry_after = response.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else self._calculate_delay(attempt)
+                    print(f"[TinybirdBatcher] {batch_id} Rate limited (429), retry in {delay:.1f}s")
+                    last_error = "Rate limited (429)"
+
+                else:
+                    last_error = f"HTTP {response.status_code}: {response.text[:100]}"
+                    print(f"[TinybirdBatcher] {batch_id} Error: {last_error}")
+
+            except httpx.TimeoutException:
+                last_error = "Request timeout"
+                print(f"[TinybirdBatcher] {batch_id} Timeout on attempt {attempt}/{self.max_retries}")
+
+            except Exception as e:
+                last_error = str(e)[:100]
+                print(f"[TinybirdBatcher] {batch_id} Exception: {last_error}")
+
+            # Retry with exponential backoff + jitter
+            if attempt < self.max_retries:
+                delay = self._calculate_delay(attempt)
+                self._total_retries += 1
+                print(f"[TinybirdBatcher] {batch_id} Retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})")
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        print(f"[TinybirdBatcher] {batch_id} FAILED after {self.max_retries} attempts: {last_error}")
+        print(f"[TinybirdBatcher] Lost {len(batch)} records: [{url_ids_str}]")
+        return False
+
+    def _calculate_delay(self, attempt: int) -> float:
+        """Calculate delay with exponential backoff + jitter."""
+        delay = min(self.base_delay * (2 ** (attempt - 1)), self.max_delay)
+        jitter = random.uniform(0, delay * 0.3)  # Up to 30% jitter
+        return delay + jitter
+
+    def _print_metrics(self):
+        """Print batch processing metrics."""
+        print(f"\n{'='*60}")
+        print(f"TINYBIRD BATCHER METRICS")
+        print(f"{'='*60}")
+        print(f"Total records processed: {self._total_records}")
+        print(f"Total batches sent: {self._total_batches}")
+        print(f"Failed batches: {self._failed_batches}")
+        print(f"Total retries: {self._total_retries}")
+        if self._total_batches > 0:
+            success_rate = ((self._total_batches - self._failed_batches) / self._total_batches) * 100
+            print(f"Success rate: {success_rate:.1f}%")
+        print(f"{'='*60}\n")
 
 
 # =============================================================================
@@ -790,7 +977,7 @@ Return ONLY valid JSON, no markdown or explanation. Omit fields not found."""
 
         # Use async generate
         response = await client.aio.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=4096)
         )
@@ -852,6 +1039,20 @@ def parse_method_preference(method: Optional[str]) -> Optional[str]:
     }
 
     return method_mapping.get(normalized)
+
+
+def should_force_brightdata_for_url(url: str) -> bool:
+    """
+    Check if URL should force Bright Data based on URL patterns.
+
+    Currently checks for Mercado Livre URLs when MERCADOLIVRE_FORCE_BRIGHTDATA=true.
+    """
+    mercadolivre_enabled = os.environ.get("MERCADOLIVRE_FORCE_BRIGHTDATA", "").lower() in ("true", "1", "yes")
+
+    if mercadolivre_enabled and "mercadolivre" in url.lower():
+        return True
+
+    return False
 
 
 def get_config() -> dict:
@@ -966,7 +1167,12 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
         METHOD_PLAYWRIGHT: ("Playwright", attempt_playwright_async),
     }
 
-    # Build attempt order based on preference or PRIMARY_SCRAPER
+    # Check URL-based rules (e.g., Mercado Livre -> Bright Data)
+    url_forced_brightdata = should_force_brightdata_for_url(url)
+    if url_forced_brightdata:
+        print(f"[{url_id}] URL pattern detected: forcing BRIGHTDATA first (mercadolivre)")
+
+    # Build attempt order based on preference, URL rules, or PRIMARY_SCRAPER
     if preferred_method and preferred_method in all_methods:
         # User specified a method - put it first, then others in default order
         attempt_order = [preferred_method]
@@ -974,6 +1180,9 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
         for m in default_order:
             if m != preferred_method:
                 attempt_order.append(m)
+    elif url_forced_brightdata:
+        # URL pattern forces Bright Data first
+        attempt_order = [METHOD_BRIGHTDATA, METHOD_FIRECRAWL, METHOD_PLAYWRIGHT]
     elif primary == PRIMARY_BRIGHTDATA:
         attempt_order = [METHOD_BRIGHTDATA, METHOD_FIRECRAWL, METHOD_PLAYWRIGHT]
     else:
@@ -1087,14 +1296,8 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
 
             print(f"[{url_id}] Completed in {time.time() - start_time:.2f}s")
 
-            # Send to Tinybird (non-blocking, errors logged but don't fail the scrape)
-            result_dict = result.to_dict()
-            try:
-                await send_to_tinybird_async(result_dict)
-            except Exception as e:
-                print(f"[{url_id}] Tinybird send error (non-fatal): {str(e)[:100]}")
-
-            return result_dict
+            # Return result (Tinybird batching handled by process_batch)
+            return result.to_dict()
 
         else:
             print(f"[{url_id}] {method_name}: Extraction failed - {extraction_error}")
@@ -1120,14 +1323,8 @@ async def scrape_url(url_id: str, url: str, method: Optional[str] = None) -> dic
 
     print(f"[{url_id}] Failed after {time.time() - start_time:.2f}s")
 
-    # Send to Tinybird (non-blocking, errors logged but don't fail the scrape)
-    result_dict = result.to_dict()
-    try:
-        await send_to_tinybird_async(result_dict)
-    except Exception as e:
-        print(f"[{url_id}] Tinybird send error (non-fatal): {str(e)[:100]}")
-
-    return result_dict
+    # Return result (Tinybird batching handled by process_batch)
+    return result.to_dict()
 
 
 # =============================================================================
@@ -1161,6 +1358,8 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     print(f"  Max Containers:  {config['max_containers']}")
     print(f"  Max Inputs/Container: {config['max_inputs']}")
     print(f"  Theoretical Capacity: {config['max_containers'] * config['max_inputs']}")
+    print(f"{'='*70}")
+    print(f"Tinybird Batching: {TINYBIRD_BATCH_SIZE} records/batch, {TINYBIRD_FLUSH_TIMEOUT}s timeout")
     print(f"{'='*70}")
     print(f"Scraping Priority: {priority_str}")
     print(f"{'='*70}\n")
@@ -1197,7 +1396,7 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
         else:
             processed_results.append(r)
 
-    elapsed = time.time() - start_time
+    scrape_elapsed = time.time() - start_time
 
     # Stats
     successful = sum(1 for r in processed_results if r.get("status") == "completed")
@@ -1208,12 +1407,35 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     via_pw = sum(1 for r in processed_results if r.get("method") == METHOD_PLAYWRIGHT)
 
     print(f"\n{'='*60}")
-    print(f"BATCH COMPLETE")
+    print(f"SCRAPING COMPLETE")
     print(f"{'='*60}")
     print(f"Total: {len(processed_results)} | Success: {successful} | Failed: {failed}")
     print(f"Screenshots: {with_screenshots}")
     print(f"Methods: Firecrawl={via_fc}, BrightData={via_bd}, Playwright={via_pw}")
-    print(f"Time: {elapsed:.2f}s | Rate: {len(processed_results)/elapsed:.2f} URLs/sec")
+    print(f"Scrape Time: {scrape_elapsed:.2f}s | Rate: {len(processed_results)/scrape_elapsed:.2f} URLs/sec")
+    print(f"{'='*60}\n")
+
+    # Send all results to Tinybird using the batcher
+    print(f"\n{'='*60}")
+    print(f"SENDING TO TINYBIRD (batched)")
+    print(f"{'='*60}")
+
+    tinybird_start = time.time()
+
+    async with TinybirdBatcher() as batcher:
+        for result in processed_results:
+            await batcher.add(result)
+        # Batcher auto-flushes remaining records on context exit
+
+    tinybird_elapsed = time.time() - tinybird_start
+    total_elapsed = time.time() - start_time
+
+    print(f"\n{'='*60}")
+    print(f"BATCH COMPLETE")
+    print(f"{'='*60}")
+    print(f"Scrape Time: {scrape_elapsed:.2f}s")
+    print(f"Tinybird Time: {tinybird_elapsed:.2f}s")
+    print(f"Total Time: {total_elapsed:.2f}s")
     print(f"{'='*60}\n")
 
     return processed_results
