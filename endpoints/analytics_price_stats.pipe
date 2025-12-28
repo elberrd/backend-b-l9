@@ -1,0 +1,42 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Aggregated price statistics for analytics dashboard.
+    Returns count, avg, min, max, and median prices.
+
+NODE analytics_price_stats_node
+SQL >
+    %
+    SELECT
+        count() as totalCount,
+        round(avg(currentPrice), 2) as avgPrice,
+        min(currentPrice) as minPrice,
+        max(currentPrice) as maxPrice,
+        round(median(currentPrice), 2) as medianPrice,
+        round(stddevPop(currentPrice), 2) as stdDevPrice
+    FROM product_scrapes
+    WHERE status = 'completed'
+        AND currentPrice > 0
+        {% if defined(company_name) %}
+        AND companyName = {{String(company_name)}}
+        {% end %}
+        {% if defined(seller_name) %}
+        AND sellerName = {{String(seller_name)}}
+        {% end %}
+        {% if defined(product_name) %}
+        AND productName = {{String(product_name)}}
+        {% end %}
+        {% if defined(date_from) %}
+        AND scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
+        {% end %}
+        {% if defined(date_to) %}
+        AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
+        {% end %}
+        {% if defined(price_min) %}
+        AND currentPrice >= {{Float64(price_min)}}
+        {% end %}
+        {% if defined(price_max) %}
+        AND currentPrice <= {{Float64(price_max)}}
+        {% end %}
+
+TYPE endpoint

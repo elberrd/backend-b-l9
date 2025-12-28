@@ -1,0 +1,46 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Time-series price data for analytics charts.
+    Supports grouping by day, week, or month.
+    Includes seller names for min/max prices.
+
+NODE analytics_chart_data_node
+SQL >
+    %
+    SELECT
+        {% if defined(group_by) and group_by == 'week' %}
+        toMonday(scrapedAt) as date,
+        {% elif defined(group_by) and group_by == 'month' %}
+        toStartOfMonth(scrapedAt) as date,
+        {% else %}
+        toDate(scrapedAt) as date,
+        {% end %}
+        round(avg(currentPrice), 2) as avgPrice,
+        min(currentPrice) as minPrice,
+        max(currentPrice) as maxPrice,
+        argMin(sellerName, currentPrice) as minPriceSeller,
+        argMax(sellerName, currentPrice) as maxPriceSeller,
+        count() as count
+    FROM product_scrapes
+    WHERE status = 'completed'
+        AND currentPrice > 0
+        {% if defined(company_name) %}
+        AND companyName = {{String(company_name)}}
+        {% end %}
+        {% if defined(seller_name) %}
+        AND sellerName = {{String(seller_name)}}
+        {% end %}
+        {% if defined(product_name) %}
+        AND productName = {{String(product_name)}}
+        {% end %}
+        {% if defined(date_from) %}
+        AND scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
+        {% end %}
+        {% if defined(date_to) %}
+        AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
+        {% end %}
+    GROUP BY date
+    ORDER BY date ASC
+
+TYPE endpoint

@@ -1,0 +1,56 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Main analytics data query with filtering support.
+    Returns paginated scrape results for the analytics table.
+
+NODE analytics_data_node
+SQL >
+    %
+    SELECT
+        urlId,
+        productUrl,
+        status,
+        scrapedAt,
+        productTitle,
+        productName,
+        brandName,
+        companyName,
+        sellerName,
+        currentPrice,
+        originalPrice,
+        discountPercentage,
+        currency,
+        availability,
+        imageUrl,
+        screenshotUrl,
+        method
+    FROM product_scrapes
+    WHERE status = 'completed'
+        AND currentPrice > 0
+        {% if defined(company_name) %}
+        AND companyName = {{String(company_name)}}
+        {% end %}
+        {% if defined(seller_name) %}
+        AND sellerName = {{String(seller_name)}}
+        {% end %}
+        {% if defined(product_name) %}
+        AND productName = {{String(product_name)}}
+        {% end %}
+        {% if defined(date_from) %}
+        AND scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
+        {% end %}
+        {% if defined(date_to) %}
+        AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
+        {% end %}
+        {% if defined(price_min) %}
+        AND currentPrice >= {{Float64(price_min)}}
+        {% end %}
+        {% if defined(price_max) %}
+        AND currentPrice <= {{Float64(price_max)}}
+        {% end %}
+    ORDER BY scrapedAt DESC
+    LIMIT {{Int32(limit, 1000)}}
+    OFFSET {{Int32(offset, 0)}}
+
+TYPE endpoint
