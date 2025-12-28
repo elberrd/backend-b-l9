@@ -40,6 +40,12 @@ SQL >
         {% if defined(date_to) %}
         AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
         {% end %}
+        {% if defined(price_min) %}
+        AND currentPrice >= {{Float64(price_min)}}
+        {% end %}
+        {% if defined(price_max) %}
+        AND currentPrice <= {{Float64(price_max)}}
+        {% end %}
     GROUP BY date
     ORDER BY date ASC
 
