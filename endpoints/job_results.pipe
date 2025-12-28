@@ -1,3 +1,5 @@
+TOKEN frontend_read READ
+
 DESCRIPTION >
     Get scrape results for a specific job by matching urlIds.
     Links scrape_jobs with product_scrapes via the jobId stored in metadata.

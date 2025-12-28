@@ -1,3 +1,5 @@
+TOKEN frontend_read READ
+
 DESCRIPTION >
     Get aggregated statistics for scrape jobs.
     Useful for dashboards and monitoring.

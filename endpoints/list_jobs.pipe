@@ -1,3 +1,5 @@
+TOKEN frontend_read READ
+
 DESCRIPTION >
     List scrape jobs with optional filtering by status, company, and date range.
     Returns the latest status of each job (ReplacingMergeTree deduplication).

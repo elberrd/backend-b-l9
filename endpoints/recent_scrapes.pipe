@@ -1,3 +1,5 @@
+TOKEN frontend_read READ
+
 DESCRIPTION >
     Get recent product scrapes with optional filtering by status and URL ID.
 

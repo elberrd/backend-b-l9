@@ -1,0 +1,33 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Get price history for a specific URL.
+    Returns all price points over time for trend analysis and charts.
+
+NODE price_history_node
+SQL >
+    %
+    SELECT
+        urlId,
+        scrapedAt,
+        currentPrice,
+        originalPrice,
+        discountPercentage,
+        currency,
+        availability,
+        productTitle,
+        sellerName,
+        seller,
+        method
+    FROM product_scrapes
+    WHERE urlId = {{String(url_id, required=True)}}
+    {% if defined(from_date) %}
+    AND scrapedAt >= parseDateTimeBestEffort({{String(from_date)}})
+    {% end %}
+    {% if defined(to_date) %}
+    AND scrapedAt <= parseDateTimeBestEffort({{String(to_date)}})
+    {% end %}
+    ORDER BY scrapedAt ASC
+    LIMIT {{Int32(limit, 1000)}}
+
+TYPE endpoint

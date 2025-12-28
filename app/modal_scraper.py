@@ -1547,22 +1547,31 @@ def extract_initial_data(item: dict) -> dict:
     field_mappings = {
         # Identity fields (always preserved)
         "urlId": "urlId",
+        # Convex reference IDs (for tracking)
+        "productId": "productId",
+        "sellerId": "sellerId",
         # Metadata fields from input
         "alertId": "alertId",
         "companyName": "companyName",
         "hasAlert": "hasAlert",
         "screenshotId": "screenshotId",
-        # Product fields that can be pre-filled
-        "productTitle": "productTitle",
-        "productName": "productTitle",  # productName maps to productTitle
+        # Product fields - keep cadastrado vs extraído separate
+        "productTitle": "productTitle",  # Extracted title from scraper
+        "productName": "productName",    # Cadastrado name from Convex (kept separate)
         "brand": "brand",
-        "brandName": "brand",  # brandName maps to brand
-        "seller": "seller",
-        "sellerName": "seller",  # sellerName maps to seller
+        "brandName": "brandName",        # Cadastrado brand from Convex
+        "seller": "seller",              # Extracted seller from scraper
+        "sellerName": "sellerName",      # Cadastrado seller from Convex (kept separate)
+        # Price fields
         "currentPrice": "currentPrice",
         "originalPrice": "originalPrice",
         "discountPercentage": "discountPercentage",
         "currency": "currency",
+        # Alert configuration (for price breach detection)
+        "minPrice": "minPrice",
+        "maxPrice": "maxPrice",
+        "alertsEnabled": "alertsEnabled",
+        # Other product fields
         "availability": "availability",
         "imageUrl": "product_image_url",
         "product_image_url": "product_image_url",
@@ -1612,6 +1621,51 @@ def merge_with_initial_data(result: dict, initial_data: dict) -> dict:
             merged[key] = value
 
     return merged
+
+
+def check_price_alert(result: dict) -> Optional[dict]:
+    """
+    Check if scraped price breaches min/max limits.
+
+    Returns alert dict if breach detected, None otherwise.
+    Used by webhook to notify Convex of price alerts.
+    """
+    # Skip if alerts not enabled or no price found
+    if not result.get("alertsEnabled"):
+        return None
+
+    current_price = result.get("currentPrice")
+    if current_price is None:
+        return None
+
+    min_price = result.get("minPrice")
+    max_price = result.get("maxPrice")
+
+    # Check min price breach (price dropped below minimum)
+    if min_price is not None and current_price < min_price:
+        breach_amount = round(min_price - current_price, 2)
+        breach_percentage = round(((min_price - current_price) / min_price) * 100, 2)
+        return {
+            "type": "price_min_breach",
+            "currentPrice": current_price,
+            "priceLimit": min_price,
+            "breachAmount": breach_amount,
+            "breachPercentage": breach_percentage,
+        }
+
+    # Check max price breach (price went above maximum)
+    if max_price is not None and current_price > max_price:
+        breach_amount = round(current_price - max_price, 2)
+        breach_percentage = round(((current_price - max_price) / max_price) * 100, 2)
+        return {
+            "type": "price_max_breach",
+            "currentPrice": current_price,
+            "priceLimit": max_price,
+            "breachAmount": breach_amount,
+            "breachPercentage": breach_percentage,
+        }
+
+    return None
 
 
 # =============================================================================
@@ -2483,7 +2537,9 @@ class TinybirdJobManager:
             "durationMs": job.durationMs,
             "completedAt": job.completedAt,
             "methodStats": json.loads(job.methodStats) if job.methodStats else None,
-            "resultsSummary": results_summary,
+            # Include results and alertsTriggered at top level
+            "results": results_summary.get("results", []),
+            "alertsTriggered": results_summary.get("alertsTriggered", []),
         }
 
         try:
@@ -2578,16 +2634,33 @@ async def process_batch_with_job(job_id: str, urls_data: List[dict], webhook_url
 
         # Send webhook if configured
         if webhook_url:
+            # Build detailed results for each URL
+            webhook_results = []
+            alerts_triggered = []
+
+            for r in results:
+                url_id = r.get("urlId")
+
+                # Build result entry for this URL
+                webhook_results.append({
+                    "urlId": url_id,
+                    "status": r.get("status"),
+                    "hasPrice": bool(r.get("currentPrice")),
+                    "hasScreenshot": bool(r.get("screenshotUrl")),
+                    "currentPrice": r.get("currentPrice"),
+                    "scrapedAt": r.get("scrapedAt"),
+                    "errorMessage": r.get("errorMessage") if r.get("status") == "error" else None,
+                })
+
+                # Check for price alerts
+                alert = check_price_alert(r)
+                if alert:
+                    alert["urlId"] = url_id
+                    alerts_triggered.append(alert)
+
             results_summary = {
-                "sampleResults": [
-                    {
-                        "urlId": r.get("urlId"),
-                        "status": r.get("status"),
-                        "productTitle": r.get("productTitle"),
-                        "currentPrice": r.get("currentPrice"),
-                    }
-                    for r in results[:5]  # Only send first 5 as sample
-                ]
+                "results": webhook_results,
+                "alertsTriggered": alerts_triggered,
             }
             await job_manager.send_webhook(job, results_summary)
 
@@ -2631,7 +2704,7 @@ api_image = (
     secrets=[modal.Secret.from_name("bausch")],
     allow_concurrent_inputs=100,
 )
-@modal.asgi_app()
+@modal.asgi_app(label="scraper-api")
 def scraper_api():
     """
     FastAPI application for the web scraper API.

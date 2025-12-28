@@ -1,6 +1,7 @@
 DESCRIPTION >
     Product scrape results from the Modal web scraper.
     Stores all scraped product data including prices, availability, and metadata.
+    Includes Convex reference IDs and alert configuration for price monitoring.
 
 SCHEMA >
     `urlId` String `json:$.urlId`,
@@ -19,6 +20,7 @@ SCHEMA >
     `availability` Nullable(UInt8) `json:$.availability`,
     `imageUrl` Nullable(String) `json:$.imageUrl`,
     `sellerName` Nullable(String) `json:$.sellerName`,
+    `seller` Nullable(String) `json:$.seller`,
     `shippingInfo` Nullable(String) `json:$.shippingInfo`,
     `shippingCost` Nullable(Float64) `json:$.shippingCost`,
     `deliveryTime` Nullable(String) `json:$.deliveryTime`,
@@ -39,10 +41,18 @@ SCHEMA >
     `alertId` Nullable(String) `json:$.alertId`,
     `companyName` Nullable(String) `json:$.companyName`,
     `hasAlert` Nullable(UInt8) `json:$.hasAlert`,
-    `screenshotId` Nullable(String) `json:$.screenshotId`
+    `screenshotId` Nullable(String) `json:$.screenshotId`,
+    `productId` Nullable(String) `json:$.productId`,
+    `sellerId` Nullable(String) `json:$.sellerId`,
+    `minPrice` Nullable(Float64) `json:$.minPrice`,
+    `maxPrice` Nullable(Float64) `json:$.maxPrice`,
+    `alertsEnabled` Nullable(UInt8) `json:$.alertsEnabled`
 
 ENGINE "MergeTree"
 ENGINE_PARTITION_KEY "toYYYYMM(scrapedAt)"
 ENGINE_SORTING_KEY "scrapedAt, urlId"
+
+FORWARD_QUERY >
+    SELECT urlId, productUrl, status, scrapedAt, errorMessage, screenshotUrl, productTitle, productName, brandName, currentPrice, originalPrice, discountPercentage, currency, availability, imageUrl, sellerName, defaultValueOfTypeName('Nullable(String)') AS seller, shippingInfo, shippingCost, deliveryTime, review_score, installmentOptions, kit, unitMeasurement, outOfStockReason, marketplaceWebsite, sku, ean, stockQuantity, otherPaymentMethods, promotionDetails, method, attempts, errors, alertId, companyName, hasAlert, screenshotId, defaultValueOfTypeName('Nullable(String)') AS productId, defaultValueOfTypeName('Nullable(String)') AS sellerId, defaultValueOfTypeName('Nullable(Float64)') AS minPrice, defaultValueOfTypeName('Nullable(Float64)') AS maxPrice, defaultValueOfTypeName('Nullable(UInt8)') AS alertsEnabled
 
 TOKEN product_scrapes_append APPEND

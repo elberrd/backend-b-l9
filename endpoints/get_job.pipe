@@ -1,3 +1,5 @@
+TOKEN frontend_read READ
+
 DESCRIPTION >
     Get a single scrape job by jobId.
     Returns the latest status of the job (ReplacingMergeTree deduplication).
