@@ -1,0 +1,33 @@
+DESCRIPTION >
+    Get aggregated statistics for scrape jobs.
+    Useful for dashboards and monitoring.
+
+NODE job_stats_node
+SQL >
+    %
+    SELECT
+        status,
+        count() as jobCount,
+        sum(totalUrls) as totalUrls,
+        sum(completedUrls) as completedUrls,
+        sum(failedUrls) as failedUrls,
+        avg(durationMs) as avgDurationMs,
+        min(createdAt) as firstJob,
+        max(createdAt) as lastJob
+    FROM scrape_jobs
+    FINAL
+    WHERE 1=1
+        {% if defined(company_name) %}
+        AND companyName = {{String(company_name)}}
+        {% end %}
+        {% if defined(from_date) %}
+        AND createdAt >= parseDateTimeBestEffort({{String(from_date)}})
+        {% end %}
+        {% if defined(to_date) %}
+        AND createdAt <= parseDateTimeBestEffort({{String(to_date)}})
+        {% end %}
+    GROUP BY status
+    ORDER BY jobCount DESC
+
+TYPE endpoint
+

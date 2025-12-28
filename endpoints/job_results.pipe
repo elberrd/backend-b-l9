@@ -1,0 +1,39 @@
+DESCRIPTION >
+    Get scrape results for a specific job by matching urlIds.
+    Links scrape_jobs with product_scrapes via the jobId stored in metadata.
+
+NODE job_results_node
+SQL >
+    %
+    SELECT
+        ps.urlId,
+        ps.productUrl,
+        ps.status,
+        ps.scrapedAt,
+        ps.productTitle,
+        ps.brandName,
+        ps.currentPrice,
+        ps.originalPrice,
+        ps.discountPercentage,
+        ps.currency,
+        ps.availability,
+        ps.imageUrl,
+        ps.sellerName,
+        ps.screenshotUrl,
+        ps.method,
+        ps.errorMessage,
+        ps.companyName,
+        ps.alertId
+    FROM product_scrapes ps
+    WHERE ps.urlId IN (
+        SELECT urlId
+        FROM product_scrapes
+        WHERE companyName = {{String(company_name, required=True)}}
+        AND scrapedAt >= parseDateTimeBestEffort({{String(from_time, required=True)}})
+        AND scrapedAt <= parseDateTimeBestEffort({{String(to_time, required=True)}})
+    )
+    ORDER BY ps.scrapedAt DESC
+    LIMIT {{Int32(limit, 1000)}}
+
+TYPE endpoint
+

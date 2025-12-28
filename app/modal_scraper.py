@@ -65,10 +65,10 @@ import random
 import re
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 # =============================================================================
 # Modal App Configuration
@@ -2254,3 +2254,630 @@ def main(input_file: str = None, input_json: str = None):
         }, f, ensure_ascii=False, indent=2)
 
     print(f"\nSaved: {output_file}")
+
+
+# =============================================================================
+# Tinybird Job Manager
+# =============================================================================
+
+TINYBIRD_JOBS_DATASOURCE = "scrape_jobs"
+
+
+@dataclass
+class JobRecord:
+    """Represents a scrape job record for Tinybird."""
+    jobId: str
+    status: str  # pending, processing, completed, failed, partial
+    totalUrls: int = 0
+    completedUrls: int = 0
+    failedUrls: int = 0
+    withScreenshots: int = 0
+    companyName: Optional[str] = None
+    createdAt: Optional[str] = None
+    startedAt: Optional[str] = None
+    completedAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    durationMs: Optional[int] = None
+    errorMessage: Optional[str] = None
+    webhookUrl: Optional[str] = None
+    webhookSent: int = 0
+    webhookSentAt: Optional[str] = None
+    primaryScraper: Optional[str] = None
+    methodStats: Optional[str] = None  # JSON string
+    requestIp: Optional[str] = None
+    userAgent: Optional[str] = None
+    metadata: Optional[str] = None  # JSON string
+
+    def to_dict(self) -> dict:
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        result = {
+            "jobId": self.jobId,
+            "status": self.status,
+            "totalUrls": self.totalUrls,
+            "completedUrls": self.completedUrls,
+            "failedUrls": self.failedUrls,
+            "withScreenshots": self.withScreenshots,
+            "webhookSent": self.webhookSent,
+            "updatedAt": self.updatedAt or now,
+        }
+        # Add optional fields
+        for field_name in [
+            "companyName", "createdAt", "startedAt", "completedAt",
+            "durationMs", "errorMessage", "webhookUrl", "webhookSentAt",
+            "primaryScraper", "methodStats", "requestIp", "userAgent", "metadata"
+        ]:
+            value = getattr(self, field_name)
+            if value is not None:
+                result[field_name] = value
+        return result
+
+
+class TinybirdJobManager:
+    """
+    Manages scrape job records in Tinybird.
+
+    Uses ReplacingMergeTree pattern: insert new rows to update status.
+    The latest row (by updatedAt) is kept for each jobId.
+    """
+
+    def __init__(self):
+        self._client = None
+
+    async def _get_client(self):
+        """Get or create async HTTP client."""
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    def _get_token(self) -> Optional[str]:
+        """Get Tinybird token from environment."""
+        return os.environ.get("TINYBIRD_TOKEN")
+
+    async def insert_job(self, job: JobRecord) -> bool:
+        """Insert or update a job record in Tinybird."""
+        token = self._get_token()
+        if not token:
+            print("[TinybirdJobManager] ERROR: TINYBIRD_TOKEN not configured")
+            return False
+
+        client = await self._get_client()
+        record = job.to_dict()
+
+        try:
+            response = await client.post(
+                f"{TINYBIRD_HOST}/v0/events?name={TINYBIRD_JOBS_DATASOURCE}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps(record, ensure_ascii=False),
+            )
+
+            if response.status_code in (200, 202):
+                print(f"[TinybirdJobManager] Job {job.jobId} -> {job.status}")
+                return True
+            else:
+                print(f"[TinybirdJobManager] ERROR: {response.status_code} - {response.text[:200]}")
+                return False
+
+        except Exception as e:
+            print(f"[TinybirdJobManager] ERROR: {str(e)[:200]}")
+            return False
+
+    async def create_job(
+        self,
+        job_id: str,
+        total_urls: int,
+        company_name: Optional[str] = None,
+        webhook_url: Optional[str] = None,
+        request_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> JobRecord:
+        """Create a new pending job."""
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        job = JobRecord(
+            jobId=job_id,
+            status="pending",
+            totalUrls=total_urls,
+            companyName=company_name,
+            createdAt=now,
+            updatedAt=now,
+            webhookUrl=webhook_url,
+            requestIp=request_ip,
+            userAgent=user_agent,
+            primaryScraper=get_primary_scraper(),
+            metadata=json.dumps(metadata) if metadata else None,
+        )
+        await self.insert_job(job)
+        return job
+
+    async def start_job(self, job: JobRecord) -> JobRecord:
+        """Mark job as processing."""
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        job.status = "processing"
+        job.startedAt = now
+        job.updatedAt = now
+        await self.insert_job(job)
+        return job
+
+    async def complete_job(
+        self,
+        job: JobRecord,
+        completed_urls: int,
+        failed_urls: int,
+        with_screenshots: int,
+        method_stats: dict,
+        error_message: Optional[str] = None,
+    ) -> JobRecord:
+        """Mark job as completed or partial."""
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        job.completedUrls = completed_urls
+        job.failedUrls = failed_urls
+        job.withScreenshots = with_screenshots
+        job.completedAt = now
+        job.updatedAt = now
+        job.methodStats = json.dumps(method_stats)
+
+        # Calculate duration
+        if job.startedAt:
+            try:
+                start = datetime.strptime(job.startedAt, '%Y-%m-%d %H:%M:%S.%f')
+                end = datetime.strptime(now, '%Y-%m-%d %H:%M:%S.%f')
+                job.durationMs = int((end - start).total_seconds() * 1000)
+            except Exception:
+                pass
+
+        # Determine final status
+        if failed_urls == job.totalUrls:
+            job.status = "failed"
+            job.errorMessage = error_message or "All URLs failed"
+        elif failed_urls > 0:
+            job.status = "partial"
+        else:
+            job.status = "completed"
+
+        await self.insert_job(job)
+        return job
+
+    async def fail_job(self, job: JobRecord, error_message: str) -> JobRecord:
+        """Mark job as failed."""
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        job.status = "failed"
+        job.errorMessage = error_message[:500]
+        job.completedAt = now
+        job.updatedAt = now
+
+        if job.startedAt:
+            try:
+                start = datetime.strptime(job.startedAt, '%Y-%m-%d %H:%M:%S.%f')
+                end = datetime.strptime(now, '%Y-%m-%d %H:%M:%S.%f')
+                job.durationMs = int((end - start).total_seconds() * 1000)
+            except Exception:
+                pass
+
+        await self.insert_job(job)
+        return job
+
+    async def send_webhook(self, job: JobRecord, results_summary: dict) -> bool:
+        """Send webhook notification when job completes."""
+        if not job.webhookUrl:
+            return False
+
+        client = await self._get_client()
+        payload = {
+            "jobId": job.jobId,
+            "status": job.status,
+            "totalUrls": job.totalUrls,
+            "completedUrls": job.completedUrls,
+            "failedUrls": job.failedUrls,
+            "withScreenshots": job.withScreenshots,
+            "durationMs": job.durationMs,
+            "completedAt": job.completedAt,
+            "methodStats": json.loads(job.methodStats) if job.methodStats else None,
+            "resultsSummary": results_summary,
+        }
+
+        try:
+            response = await client.post(
+                job.webhookUrl,
+                json=payload,
+                timeout=10.0,
+            )
+
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            job.webhookSent = 1 if response.status_code < 400 else 0
+            job.webhookSentAt = now
+            job.updatedAt = now
+            await self.insert_job(job)
+
+            if response.status_code < 400:
+                print(f"[TinybirdJobManager] Webhook sent for job {job.jobId}")
+                return True
+            else:
+                print(f"[TinybirdJobManager] Webhook failed: {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"[TinybirdJobManager] Webhook error: {str(e)[:100]}")
+            return False
+
+
+# =============================================================================
+# Process Batch with Job Tracking
+# =============================================================================
+
+@app.function(
+    image=scraper_image,
+    timeout=7200,  # 2 hours for large batches
+    secrets=[modal.Secret.from_name("bausch")],
+)
+async def process_batch_with_job(job_id: str, urls_data: List[dict], webhook_url: Optional[str] = None) -> dict:
+    """
+    Process batch with job tracking in Tinybird.
+
+    This is the main entry point for the API. It:
+    1. Updates job status to 'processing'
+    2. Runs the scraping
+    3. Updates job status to 'completed'/'partial'/'failed'
+    4. Sends webhook if configured
+    5. Returns summary (not full results - those go to product_scrapes)
+    """
+    job_manager = TinybirdJobManager()
+
+    # Extract company name from first URL if available
+    company_name = None
+    if urls_data:
+        company_name = urls_data[0].get("companyName")
+
+    # Create job record
+    job = JobRecord(
+        jobId=job_id,
+        status="pending",
+        totalUrls=len(urls_data),
+        companyName=company_name,
+        webhookUrl=webhook_url,
+        primaryScraper=get_primary_scraper(),
+        createdAt=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+    )
+
+    try:
+        # Mark as processing
+        job = await job_manager.start_job(job)
+
+        # Run the actual batch processing
+        results = await process_batch.local(urls_data)
+
+        # Calculate stats
+        completed = sum(1 for r in results if r.get("status") == "completed")
+        failed = len(results) - completed
+        with_screenshots = sum(1 for r in results if r.get("screenshotUrl"))
+
+        method_stats = {
+            "firecrawl": sum(1 for r in results if r.get("method") == METHOD_FIRECRAWL),
+            "brightdata": sum(1 for r in results if r.get("method") == METHOD_BRIGHTDATA),
+            "playwright": sum(1 for r in results if r.get("method") == METHOD_PLAYWRIGHT),
+        }
+
+        # Complete the job
+        job = await job_manager.complete_job(
+            job=job,
+            completed_urls=completed,
+            failed_urls=failed,
+            with_screenshots=with_screenshots,
+            method_stats=method_stats,
+        )
+
+        # Send webhook if configured
+        if webhook_url:
+            results_summary = {
+                "sampleResults": [
+                    {
+                        "urlId": r.get("urlId"),
+                        "status": r.get("status"),
+                        "productTitle": r.get("productTitle"),
+                        "currentPrice": r.get("currentPrice"),
+                    }
+                    for r in results[:5]  # Only send first 5 as sample
+                ]
+            }
+            await job_manager.send_webhook(job, results_summary)
+
+        await job_manager.close()
+
+        return {
+            "jobId": job_id,
+            "status": job.status,
+            "totalUrls": job.totalUrls,
+            "completedUrls": job.completedUrls,
+            "failedUrls": job.failedUrls,
+            "withScreenshots": job.withScreenshots,
+            "durationMs": job.durationMs,
+            "methodStats": method_stats,
+        }
+
+    except Exception as e:
+        # Mark job as failed
+        await job_manager.fail_job(job, str(e))
+        await job_manager.close()
+        raise
+
+
+# =============================================================================
+# FastAPI Web Endpoints
+# =============================================================================
+
+# Image for the web API (lighter than scraper image)
+api_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "fastapi[standard]>=0.115.0",
+        "httpx>=0.27.0",
+        "pydantic>=2.0.0",
+    )
+)
+
+
+@app.function(
+    image=api_image,
+    secrets=[modal.Secret.from_name("bausch")],
+    allow_concurrent_inputs=100,
+)
+@modal.asgi_app()
+def scraper_api():
+    """
+    FastAPI application for the web scraper API.
+
+    Endpoints:
+    - POST /api/v1/scrape - Submit a new scrape job
+    - GET /api/v1/scrape/{job_id} - Get job status
+    - GET /api/v1/scrape - List recent jobs
+    - GET /health - Health check
+    """
+    from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi.responses import JSONResponse
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel, Field
+    from typing import List, Optional
+    import httpx
+
+    api = FastAPI(
+        title="Modal Web Scraper API",
+        description="Async web scraping API with job tracking",
+        version="1.0.0",
+    )
+
+    # CORS middleware
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # =========================================================================
+    # Pydantic Models
+    # =========================================================================
+
+    class UrlItem(BaseModel):
+        urlId: str = Field(..., description="Unique identifier for this URL")
+        url: Optional[str] = Field(None, description="URL to scrape")
+        productUrl: Optional[str] = Field(None, description="Alternative field for URL")
+        method: Optional[str] = Field(None, description="Preferred scraping method")
+        companyName: Optional[str] = Field(None, description="Company name")
+        alertId: Optional[str] = Field(None, description="Alert ID")
+        # Allow any additional fields
+        model_config = {"extra": "allow"}
+
+    class ScrapeRequest(BaseModel):
+        urls: List[UrlItem] = Field(..., min_length=1, max_length=10000)
+        webhookUrl: Optional[str] = Field(None, description="Webhook URL for completion notification")
+        companyName: Optional[str] = Field(None, description="Company name for all URLs")
+
+    class ScrapeResponse(BaseModel):
+        jobId: str
+        status: str
+        totalUrls: int
+        message: str
+
+    class JobStatusResponse(BaseModel):
+        jobId: str
+        status: str
+        totalUrls: int
+        completedUrls: int
+        failedUrls: int
+        withScreenshots: int
+        createdAt: Optional[str]
+        startedAt: Optional[str]
+        completedAt: Optional[str]
+        durationMs: Optional[int]
+        errorMessage: Optional[str]
+        methodStats: Optional[dict]
+
+    # =========================================================================
+    # Helper Functions
+    # =========================================================================
+
+    async def query_tinybird(endpoint: str, params: dict) -> dict:
+        """Query Tinybird API endpoint."""
+        token = os.environ.get("TINYBIRD_TOKEN")
+        if not token:
+            raise HTTPException(500, "Tinybird not configured")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{TINYBIRD_HOST}/v0/pipes/{endpoint}.json",
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(502, f"Tinybird query failed: {response.text[:200]}")
+
+            return response.json()
+
+    # =========================================================================
+    # Endpoints
+    # =========================================================================
+
+    @api.get("/health")
+    async def health_check():
+        """Health check endpoint."""
+        return {
+            "status": "healthy",
+            "service": "modal-web-scraper",
+            "version": "3.3",
+            "primaryScraper": os.environ.get("PRIMARY_SCRAPER", "firecrawl"),
+        }
+
+    @api.post("/api/v1/scrape", response_model=ScrapeResponse)
+    async def submit_scrape(request: Request, body: ScrapeRequest):
+        """
+        Submit a new scrape job.
+
+        The job runs asynchronously. Use GET /api/v1/scrape/{job_id} to check status.
+        Results are stored in Tinybird product_scrapes table.
+        """
+        # Generate job ID
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+
+        # Prepare URLs data
+        urls_data = []
+        for item in body.urls:
+            url_dict = item.model_dump(exclude_none=True)
+            # Apply company name from request if not set per-URL
+            if body.companyName and not url_dict.get("companyName"):
+                url_dict["companyName"] = body.companyName
+            urls_data.append(url_dict)
+
+        # Get client info
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+
+        # Create initial job record in Tinybird
+        job_manager = TinybirdJobManager()
+        job = await job_manager.create_job(
+            job_id=job_id,
+            total_urls=len(urls_data),
+            company_name=body.companyName or (urls_data[0].get("companyName") if urls_data else None),
+            webhook_url=body.webhookUrl,
+            request_ip=client_ip,
+            user_agent=user_agent,
+        )
+        await job_manager.close()
+
+        # Spawn the batch processing (non-blocking)
+        process_batch_with_job.spawn(job_id, urls_data, body.webhookUrl)
+
+        return ScrapeResponse(
+            jobId=job_id,
+            status="pending",
+            totalUrls=len(urls_data),
+            message=f"Job submitted. Query GET /api/v1/scrape/{job_id} for status.",
+        )
+
+    @api.get("/api/v1/scrape/{job_id}", response_model=JobStatusResponse)
+    async def get_job_status(job_id: str):
+        """
+        Get the status of a scrape job.
+
+        Returns job metadata and progress. For full results, query the
+        product_scrapes table in Tinybird filtered by time range.
+        """
+        try:
+            result = await query_tinybird("get_job", {"job_id": job_id})
+            data = result.get("data", [])
+
+            if not data:
+                raise HTTPException(404, f"Job {job_id} not found")
+
+            job = data[0]
+
+            # Parse methodStats if present
+            method_stats = None
+            if job.get("methodStats"):
+                try:
+                    method_stats = json.loads(job["methodStats"])
+                except Exception:
+                    pass
+
+            return JobStatusResponse(
+                jobId=job["jobId"],
+                status=job["status"],
+                totalUrls=job["totalUrls"],
+                completedUrls=job["completedUrls"],
+                failedUrls=job["failedUrls"],
+                withScreenshots=job["withScreenshots"],
+                createdAt=job.get("createdAt"),
+                startedAt=job.get("startedAt"),
+                completedAt=job.get("completedAt"),
+                durationMs=job.get("durationMs"),
+                errorMessage=job.get("errorMessage"),
+                methodStats=method_stats,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"Error querying job: {str(e)[:200]}")
+
+    @api.get("/api/v1/scrape")
+    async def list_jobs(
+        status: Optional[str] = Query(None, description="Filter by status"),
+        company_name: Optional[str] = Query(None, description="Filter by company"),
+        limit: int = Query(50, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ):
+        """
+        List recent scrape jobs with optional filtering.
+        """
+        params = {"limit": limit, "offset": offset}
+        if status:
+            params["status"] = status
+        if company_name:
+            params["company_name"] = company_name
+
+        try:
+            result = await query_tinybird("list_jobs", params)
+            return {
+                "jobs": result.get("data", []),
+                "count": len(result.get("data", [])),
+                "limit": limit,
+                "offset": offset,
+            }
+        except Exception as e:
+            raise HTTPException(500, f"Error listing jobs: {str(e)[:200]}")
+
+    @api.get("/api/v1/stats")
+    async def get_stats(
+        company_name: Optional[str] = Query(None),
+        from_date: Optional[str] = Query(None, description="ISO date string"),
+        to_date: Optional[str] = Query(None, description="ISO date string"),
+    ):
+        """
+        Get aggregated job statistics.
+        """
+        params = {}
+        if company_name:
+            params["company_name"] = company_name
+        if from_date:
+            params["from_date"] = from_date
+        if to_date:
+            params["to_date"] = to_date
+
+        try:
+            result = await query_tinybird("job_stats", params)
+            return {"stats": result.get("data", [])}
+        except Exception as e:
+            raise HTTPException(500, f"Error getting stats: {str(e)[:200]}")
+
+    return api

@@ -1,0 +1,44 @@
+DESCRIPTION >
+    List scrape jobs with optional filtering by status, company, and date range.
+    Returns the latest status of each job (ReplacingMergeTree deduplication).
+
+NODE list_jobs_node
+SQL >
+    %
+    SELECT
+        jobId,
+        status,
+        companyName,
+        totalUrls,
+        completedUrls,
+        failedUrls,
+        withScreenshots,
+        createdAt,
+        startedAt,
+        completedAt,
+        updatedAt,
+        durationMs,
+        errorMessage,
+        primaryScraper,
+        methodStats
+    FROM scrape_jobs
+    FINAL
+    WHERE 1=1
+        {% if defined(status) %}
+        AND status = {{String(status)}}
+        {% end %}
+        {% if defined(company_name) %}
+        AND companyName = {{String(company_name)}}
+        {% end %}
+        {% if defined(from_date) %}
+        AND createdAt >= parseDateTimeBestEffort({{String(from_date)}})
+        {% end %}
+        {% if defined(to_date) %}
+        AND createdAt <= parseDateTimeBestEffort({{String(to_date)}})
+        {% end %}
+    ORDER BY createdAt DESC
+    LIMIT {{Int32(limit, 50)}}
+    OFFSET {{Int32(offset, 0)}}
+
+TYPE endpoint
+

@@ -1,0 +1,33 @@
+DESCRIPTION >
+    Get recent product scrapes with optional filtering by status and URL ID.
+
+NODE recent_scrapes_node
+SQL >
+    %
+    SELECT
+        urlId,
+        productUrl,
+        status,
+        scrapedAt,
+        productTitle,
+        brandName,
+        currentPrice,
+        originalPrice,
+        discountPercentage,
+        currency,
+        availability,
+        sellerName,
+        method,
+        errorMessage
+    FROM product_scrapes
+    WHERE 1=1
+        {% if defined(status) %}
+        AND status = {{String(status, 'completed')}}
+        {% end %}
+        {% if defined(url_id) %}
+        AND urlId = {{String(url_id)}}
+        {% end %}
+    ORDER BY scrapedAt DESC
+    LIMIT {{Int32(limit, 100)}}
+
+TYPE endpoint

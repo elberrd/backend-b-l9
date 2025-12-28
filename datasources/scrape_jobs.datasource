@@ -1,0 +1,35 @@
+DESCRIPTION >
+    Scrape job tracking table for the Modal web scraper API.
+    Tracks job status, progress, and metadata for async job processing.
+    Uses ReplacingMergeTree to support status updates (insert new row with same jobId).
+
+SCHEMA >
+    `jobId` String `json:$.jobId`,
+    `status` String `json:$.status`,
+    `companyName` Nullable(String) `json:$.companyName`,
+    `totalUrls` UInt32 `json:$.totalUrls`,
+    `completedUrls` UInt32 `json:$.completedUrls`,
+    `failedUrls` UInt32 `json:$.failedUrls`,
+    `withScreenshots` UInt32 `json:$.withScreenshots`,
+    `createdAt` DateTime64(3) `json:$.createdAt`,
+    `startedAt` Nullable(DateTime64(3)) `json:$.startedAt`,
+    `completedAt` Nullable(DateTime64(3)) `json:$.completedAt`,
+    `updatedAt` DateTime64(3) `json:$.updatedAt`,
+    `durationMs` Nullable(Int64) `json:$.durationMs`,
+    `errorMessage` Nullable(String) `json:$.errorMessage`,
+    `webhookUrl` Nullable(String) `json:$.webhookUrl`,
+    `webhookSent` UInt8 `json:$.webhookSent`,
+    `webhookSentAt` Nullable(DateTime64(3)) `json:$.webhookSentAt`,
+    `primaryScraper` Nullable(String) `json:$.primaryScraper`,
+    `methodStats` Nullable(String) `json:$.methodStats`,
+    `requestIp` Nullable(String) `json:$.requestIp`,
+    `userAgent` Nullable(String) `json:$.userAgent`,
+    `metadata` Nullable(String) `json:$.metadata`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_VER "updatedAt"
+ENGINE_PARTITION_KEY "toYYYYMM(createdAt)"
+ENGINE_SORTING_KEY "jobId"
+
+TOKEN scrape_jobs_append APPEND
+

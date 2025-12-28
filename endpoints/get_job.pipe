@@ -1,0 +1,34 @@
+DESCRIPTION >
+    Get a single scrape job by jobId.
+    Returns the latest status of the job (ReplacingMergeTree deduplication).
+
+NODE get_job_node
+SQL >
+    %
+    SELECT
+        jobId,
+        status,
+        companyName,
+        totalUrls,
+        completedUrls,
+        failedUrls,
+        withScreenshots,
+        createdAt,
+        startedAt,
+        completedAt,
+        updatedAt,
+        durationMs,
+        errorMessage,
+        webhookUrl,
+        webhookSent,
+        webhookSentAt,
+        primaryScraper,
+        methodStats,
+        metadata
+    FROM scrape_jobs
+    FINAL
+    WHERE jobId = {{String(job_id, required=True)}}
+    LIMIT 1
+
+TYPE endpoint
+
