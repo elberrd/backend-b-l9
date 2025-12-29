@@ -1098,6 +1098,7 @@ async def attempt_firecrawl_async(url: str, url_id: str) -> AttemptResult:
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
             # Call Firecrawl API v2
+            wait_seconds = int(os.environ.get("FIRECRAWL_WAIT_SECONDS", "2"))
             response = await client.post(
                 "https://api.firecrawl.dev/v2/scrape",
                 headers={
@@ -1107,7 +1108,7 @@ async def attempt_firecrawl_async(url: str, url_id: str) -> AttemptResult:
                 json={
                     "url": url,
                     "formats": ["html", "screenshot"],
-                    "waitFor": 2000,
+                    "waitFor": wait_seconds * 1000,
                     "timeout": 60000,
                 }
             )
@@ -2702,8 +2703,8 @@ api_image = (
 @app.function(
     image=api_image,
     secrets=[modal.Secret.from_name("bausch")],
-    allow_concurrent_inputs=100,
 )
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app(label="scraper-api")
 def scraper_api():
     """
