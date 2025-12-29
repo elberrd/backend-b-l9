@@ -46,13 +46,19 @@ SCHEMA >
     `sellerId` Nullable(String) `json:$.sellerId`,
     `minPrice` Nullable(Float64) `json:$.minPrice`,
     `maxPrice` Nullable(Float64) `json:$.maxPrice`,
-    `alertsEnabled` Nullable(UInt8) `json:$.alertsEnabled`
+    `alertsEnabled` Nullable(UInt8) `json:$.alertsEnabled`,
+    `businessId` Nullable(String) `json:$.businessId`,
+    `businessName` Nullable(String) `json:$.businessName`,
+    `channelId` Nullable(String) `json:$.channelId`,
+    `channelName` Nullable(String) `json:$.channelName`,
+    `familyId` Nullable(String) `json:$.familyId`,
+    `familyName` Nullable(String) `json:$.familyName`
 
 ENGINE "MergeTree"
 ENGINE_PARTITION_KEY "toYYYYMM(scrapedAt)"
 ENGINE_SORTING_KEY "scrapedAt, urlId"
 
 FORWARD_QUERY >
-    SELECT urlId, productUrl, status, scrapedAt, errorMessage, screenshotUrl, productTitle, productName, brandName, currentPrice, originalPrice, discountPercentage, currency, availability, imageUrl, sellerName, defaultValueOfTypeName('Nullable(String)') AS seller, shippingInfo, shippingCost, deliveryTime, review_score, installmentOptions, kit, unitMeasurement, outOfStockReason, marketplaceWebsite, sku, ean, stockQuantity, otherPaymentMethods, promotionDetails, method, attempts, errors, alertId, companyName, hasAlert, screenshotId, defaultValueOfTypeName('Nullable(String)') AS productId, defaultValueOfTypeName('Nullable(String)') AS sellerId, defaultValueOfTypeName('Nullable(Float64)') AS minPrice, defaultValueOfTypeName('Nullable(Float64)') AS maxPrice, defaultValueOfTypeName('Nullable(UInt8)') AS alertsEnabled
+    SELECT urlId, productUrl, status, scrapedAt, errorMessage, screenshotUrl, productTitle, productName, brandName, currentPrice, originalPrice, discountPercentage, currency, availability, imageUrl, sellerName, defaultValueOfTypeName('Nullable(String)') AS seller, shippingInfo, shippingCost, deliveryTime, review_score, installmentOptions, kit, unitMeasurement, outOfStockReason, marketplaceWebsite, sku, ean, stockQuantity, otherPaymentMethods, promotionDetails, method, attempts, errors, alertId, companyName, hasAlert, screenshotId, defaultValueOfTypeName('Nullable(String)') AS productId, defaultValueOfTypeName('Nullable(String)') AS sellerId, defaultValueOfTypeName('Nullable(Float64)') AS minPrice, defaultValueOfTypeName('Nullable(Float64)') AS maxPrice, defaultValueOfTypeName('Nullable(UInt8)') AS alertsEnabled, defaultValueOfTypeName('Nullable(String)') AS businessId, defaultValueOfTypeName('Nullable(String)') AS businessName, defaultValueOfTypeName('Nullable(String)') AS channelId, defaultValueOfTypeName('Nullable(String)') AS channelName, defaultValueOfTypeName('Nullable(String)') AS familyId, defaultValueOfTypeName('Nullable(String)') AS familyName
 
 TOKEN product_scrapes_append APPEND

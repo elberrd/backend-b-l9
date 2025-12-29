@@ -223,6 +223,13 @@ class ScrapeResult:
     companyName: Optional[str] = None
     hasAlert: Optional[bool] = None
     screenshotId: Optional[str] = None
+    # Categorization fields (Business, Channel, Family)
+    businessId: Optional[str] = None
+    businessName: Optional[str] = None
+    channelId: Optional[str] = None
+    channelName: Optional[str] = None
+    familyId: Optional[str] = None
+    familyName: Optional[str] = None
 
     def to_dict(self) -> dict:
         result = {
@@ -238,7 +245,8 @@ class ScrapeResult:
             "deliveryTime", "review_score", "installmentOptions", "kit", "unitMeasurement",
             "outOfStockReason", "marketplaceWebsite", "sku", "ean", "stockQuantity",
             "otherPaymentMethods", "promotionDetails", "method", "attempts", "errors",
-            "alertId", "companyName", "hasAlert", "screenshotId"
+            "alertId", "companyName", "hasAlert", "screenshotId",
+            "businessId", "businessName", "channelId", "channelName", "familyId", "familyName"
         ]:
             value = getattr(self, field_name)
             if value is not None:
@@ -941,6 +949,13 @@ class TinybirdBatcher:
             "companyName": scrape_result.get("companyName"),
             "hasAlert": 1 if scrape_result.get("hasAlert") else (0 if scrape_result.get("hasAlert") is False else None),
             "screenshotId": scrape_result.get("screenshotId"),
+            # Categorization fields (Business, Channel, Family)
+            "businessId": scrape_result.get("businessId"),
+            "businessName": scrape_result.get("businessName"),
+            "channelId": scrape_result.get("channelId"),
+            "channelName": scrape_result.get("channelName"),
+            "familyId": scrape_result.get("familyId"),
+            "familyName": scrape_result.get("familyName"),
         }
 
         return {k: v for k, v in record.items() if v is not None}
@@ -1590,6 +1605,13 @@ def extract_initial_data(item: dict) -> dict:
         "stockQuantity": "stockQuantity",
         "otherPaymentMethods": "otherPaymentMethods",
         "promotionDetails": "promotionDetails",
+        # Categorization fields (Business, Channel, Family)
+        "businessId": "businessId",
+        "businessName": "businessName",
+        "channelId": "channelId",
+        "channelName": "channelName",
+        "familyId": "familyId",
+        "familyName": "familyName",
     }
 
     initial_data = {}
@@ -2749,6 +2771,13 @@ def scraper_api():
         method: Optional[str] = Field(None, description="Preferred scraping method")
         companyName: Optional[str] = Field(None, description="Company name")
         alertId: Optional[str] = Field(None, description="Alert ID")
+        # Categorization fields (Business, Channel, Family)
+        businessId: Optional[str] = Field(None, description="Business ID for categorization")
+        businessName: Optional[str] = Field(None, description="Business name for categorization")
+        channelId: Optional[str] = Field(None, description="Channel ID for categorization")
+        channelName: Optional[str] = Field(None, description="Channel name for categorization")
+        familyId: Optional[str] = Field(None, description="Family ID for categorization")
+        familyName: Optional[str] = Field(None, description="Family name for categorization")
         # Allow any additional fields
         model_config = {"extra": "allow"}
 
