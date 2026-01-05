@@ -53,7 +53,7 @@ SQL >
     FROM product_scrapes
     WHERE 1=1
         {% if defined(status) %}
-        AND status = {{String(status, 'completed')}}
+        AND status = {{String(status)}}
         {% end %}
         {% if defined(url_id) %}
         AND urlId = {{String(url_id)}}
