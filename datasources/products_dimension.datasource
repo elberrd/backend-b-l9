@@ -1,0 +1,11 @@
+SCHEMA >
+    `productId` String `json:$.productId`,
+    `productName` String `json:$.productName`,
+    `brandId` String `json:$.brandId`,
+    `brandName` String `json:$.brandName`,
+    `updatedAt` DateTime `json:$.updatedAt`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_PARTITION_KEY "toYYYYMM(updatedAt)"
+ENGINE_SORTING_KEY "productId, updatedAt"
+ENGINE_VER "updatedAt"

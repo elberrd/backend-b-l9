@@ -1,0 +1,19 @@
+NODE scrapes_by_product_id_node
+SQL >
+    SELECT
+        s.*,
+        p.productName as currentProductName
+    FROM product_scrapes s
+    LEFT JOIN (
+        SELECT
+            productId,
+            argMax(productName, updatedAt) as productName
+        FROM products_dimension
+        GROUP BY productId
+    ) p ON s.productId = p.productId
+    WHERE s.productId = {{ String(product_id, '') }}
+    ORDER BY s.scrapedAt DESC
+    LIMIT {{ Int32(limit, 1000) }}
+
+TYPE materialized
+DATASOURCE scrapes_by_product_id_ds

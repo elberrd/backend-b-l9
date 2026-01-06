@@ -1,0 +1,10 @@
+SCHEMA >
+    `sellerId` String `json:$.sellerId`,
+    `sellerName` String `json:$.sellerName`,
+    `country` String `json:$.country`,
+    `updatedAt` DateTime `json:$.updatedAt`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_PARTITION_KEY "toYYYYMM(updatedAt)"
+ENGINE_SORTING_KEY "sellerId, updatedAt"
+ENGINE_VER "updatedAt"

@@ -1,0 +1,63 @@
+NODE scrapes_with_current_names_node
+SQL >
+    SELECT
+        s.urlId,
+        s.scrapedAt,
+        s.status,
+        s.productId,
+        s.sellerId,
+        s.productName as historicalProductName,
+        s.sellerName as historicalSellerName,
+        p.productName as currentProductName,
+        sel.sellerName as currentSellerName,
+        if(s.productName != p.productName, 1, 0) as productNameChanged,
+        if(s.sellerName != sel.sellerName, 1, 0) as sellerNameChanged,
+        s.currentPrice,
+        s.originalPrice,
+        s.discountPercentage,
+        s.currency,
+        s.availability,
+        s.imageUrl,
+        s.screenshotUrl,
+        s.productTitle,
+        s.brandName,
+        s.companyName,
+        s.marketplaceWebsite,
+        s.shippingInfo,
+        s.shippingCost,
+        s.deliveryTime,
+        s.review_score,
+        s.installmentOptions,
+        s.kit,
+        s.sku,
+        s.ean,
+        s.stockQuantity,
+        s.errorMessage,
+        s.minPrice,
+        s.maxPrice,
+        s.alertsEnabled,
+        s.alertTriggered,
+        s.alertType,
+        s.productUrl,
+        s.method
+    FROM product_scrapes s
+    LEFT JOIN (
+        SELECT productId, argMax(productName, updatedAt) as productName
+        FROM products_dimension GROUP BY productId
+    ) p ON s.productId = p.productId
+    LEFT JOIN (
+        SELECT sellerId, argMax(sellerName, updatedAt) as sellerName, argMax(country, updatedAt) as country
+        FROM sellers_dimension GROUP BY sellerId
+    ) sel ON s.sellerId = sel.sellerId
+    WHERE
+        {% if defined(url_id) %}
+            s.urlId = {{ String(url_id) }}
+        {% end %}
+        {% if defined(product_id) %}
+            AND s.productId = {{ String(product_id) }}
+        {% end %}
+    ORDER BY s.scrapedAt DESC
+    LIMIT {{ Int32(limit, 100) }}
+
+TYPE materialized
+DATASOURCE scrapes_with_current_names_ds
