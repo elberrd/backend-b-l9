@@ -1,0 +1,11 @@
+SCHEMA >
+    `companyId` String `json:$.companyId`,
+    `companyName` String `json:$.companyName`,
+    `website` String `json:$.website`,
+    `description` String `json:$.description`,
+    `updatedAt` DateTime `json:$.updatedAt`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_PARTITION_KEY "toYYYYMM(updatedAt)"
+ENGINE_SORTING_KEY "companyId"
+ENGINE_VER "updatedAt"

@@ -1,0 +1,12 @@
+SCHEMA >
+    `channelId` String `json:$.channelId`,
+    `channelName` String `json:$.channelName`,
+    `businessId` String `json:$.businessId`,
+    `businessName` String `json:$.businessName`,
+    `description` String `json:$.description`,
+    `updatedAt` DateTime `json:$.updatedAt`
+
+ENGINE "ReplacingMergeTree"
+ENGINE_PARTITION_KEY "toYYYYMM(updatedAt)"
+ENGINE_SORTING_KEY "channelId"
+ENGINE_VER "updatedAt"
