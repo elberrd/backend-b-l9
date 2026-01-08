@@ -1,0 +1,86 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Compare product prices across sellers at two specific dates.
+    Uses productName and sellerName for filtering (more reliable than IDs).
+    Finds the closest scrape to each date within a tolerance window (default 24h).
+    Returns price changes and percentage changes.
+
+NODE price_comparison_node
+SQL >
+    %
+    -- Parse input dates and calculate tolerance windows
+    WITH date_params AS (
+        SELECT
+            parseDateTimeBestEffort({{ String(date1, '2026-01-01') }}) as target_date1,
+            parseDateTimeBestEffort({{ String(date2, '2026-01-08') }}) as target_date2,
+            {{ Int32(tolerance, 24) }} as tolerance_hours
+    ),
+
+    -- Get all scrapes for the selected products and sellers by NAME
+    filtered_scrapes AS (
+        SELECT
+            productName,
+            sellerName,
+            companyName,
+            scrapedAt,
+            currentPrice
+        FROM product_scrapes
+        WHERE status = 'completed'
+            AND currentPrice > 0
+            AND productName IN ({{ Array(product_name, 'String') }})
+            AND sellerName IN ({{ Array(seller_name, 'String') }})
+    ),
+
+    -- Find closest scrape to date1 for each product-seller combination
+    closest_date1 AS (
+        SELECT
+            fs.productName,
+            fs.sellerName,
+            argMin(fs.companyName, abs(date_diff('second', fs.scrapedAt, dp.target_date1))) as companyName,
+            argMin(fs.scrapedAt, abs(date_diff('second', fs.scrapedAt, dp.target_date1))) as scrapedAt,
+            argMin(fs.currentPrice, abs(date_diff('second', fs.scrapedAt, dp.target_date1))) as price
+        FROM filtered_scrapes fs
+        CROSS JOIN date_params dp
+        WHERE abs(date_diff('hour', fs.scrapedAt, dp.target_date1)) <= dp.tolerance_hours
+        GROUP BY fs.productName, fs.sellerName
+    ),
+
+    -- Find closest scrape to date2 for each product-seller combination
+    closest_date2 AS (
+        SELECT
+            fs.productName,
+            fs.sellerName,
+            argMin(fs.companyName, abs(date_diff('second', fs.scrapedAt, dp.target_date2))) as companyName,
+            argMin(fs.scrapedAt, abs(date_diff('second', fs.scrapedAt, dp.target_date2))) as scrapedAt,
+            argMin(fs.currentPrice, abs(date_diff('second', fs.scrapedAt, dp.target_date2))) as price
+        FROM filtered_scrapes fs
+        CROSS JOIN date_params dp
+        WHERE abs(date_diff('hour', fs.scrapedAt, dp.target_date2)) <= dp.tolerance_hours
+        GROUP BY fs.productName, fs.sellerName
+    )
+
+    -- Combine all data and calculate changes
+    SELECT
+        COALESCE(d1.productName, d2.productName) as productName,
+        COALESCE(d1.companyName, d2.companyName, '') as channelName,
+        COALESCE(d1.sellerName, d2.sellerName) as sellerName,
+        d1.price as date1Price,
+        d2.price as date2Price,
+        d1.scrapedAt as date1ScrapedAt,
+        d2.scrapedAt as date2ScrapedAt,
+        round(COALESCE(d2.price, 0) - COALESCE(d1.price, 0), 2) as priceChange,
+        round(
+            if(COALESCE(d1.price, 0) > 0,
+                (COALESCE(d2.price, 0) - COALESCE(d1.price, 0)) / d1.price * 100,
+                0
+            ),
+            2
+        ) as priceChangePercent
+    FROM closest_date1 d1
+    FULL OUTER JOIN closest_date2 d2
+        ON d1.productName = d2.productName AND d1.sellerName = d2.sellerName
+    WHERE d1.productName IS NOT NULL OR d2.productName IS NOT NULL
+    ORDER BY productName, sellerName
+
+TYPE endpoint

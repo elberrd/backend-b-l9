@@ -3,6 +3,7 @@ TOKEN frontend_read READ
 DESCRIPTION >
     Returns distinct filter options (companies, sellers, products) for analytics dropdowns.
     Used for cascading filter UI.
+    Supports filtering by company, seller, or product name to enable cascading dropdowns.
 
 NODE analytics_filter_options_node
 SQL >
@@ -19,6 +20,9 @@ SQL >
         {% end %}
         {% if defined(seller_name) %}
         AND sellerName = {{String(seller_name)}}
+        {% end %}
+        {% if defined(product_name) %}
+        AND productName = {{String(product_name)}}
         {% end %}
 
 TYPE endpoint
