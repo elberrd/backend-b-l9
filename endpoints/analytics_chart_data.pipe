@@ -4,47 +4,87 @@ DESCRIPTION >
     Time-series price data for analytics charts.
     Supports grouping by day, week, or month.
     Includes seller names for min/max prices.
+    Uses dimension table JOINs for business/channel/family filtering (so name changes auto-propagate).
 
 NODE analytics_chart_data_node
 SQL >
     %
     SELECT
         {% if defined(group_by) and group_by == 'week' %}
-        toMonday(scrapedAt) as date,
+        toMonday(s.scrapedAt) as date,
         {% elif defined(group_by) and group_by == 'month' %}
-        toStartOfMonth(scrapedAt) as date,
+        toStartOfMonth(s.scrapedAt) as date,
         {% else %}
-        toDate(scrapedAt) as date,
+        toDate(s.scrapedAt) as date,
         {% end %}
-        round(avg(currentPrice), 2) as avgPrice,
-        min(currentPrice) as minPrice,
-        max(currentPrice) as maxPrice,
-        argMin(sellerName, currentPrice) as minPriceSeller,
-        argMax(sellerName, currentPrice) as maxPriceSeller,
+        round(avg(s.currentPrice), 2) as avgPrice,
+        min(s.currentPrice) as minPrice,
+        max(s.currentPrice) as maxPrice,
+        argMin(s.sellerName, s.currentPrice) as minPriceSeller,
+        argMax(s.sellerName, s.currentPrice) as maxPriceSeller,
         count() as count
-    FROM product_scrapes
-    WHERE status = 'completed'
-        AND currentPrice > 0
+    FROM product_scrapes s
+    LEFT JOIN (
+        SELECT businessId, argMax(businessName, updatedAt) as businessName
+        FROM business_dimension
+        GROUP BY businessId
+    ) b ON s.businessId = b.businessId
+    LEFT JOIN (
+        SELECT channelId, argMax(channelName, updatedAt) as channelName
+        FROM channels_dimension
+        GROUP BY channelId
+    ) c ON s.channelId = c.channelId
+    LEFT JOIN (
+        SELECT familyId, argMax(familyName, updatedAt) as familyName
+        FROM families_dimension
+        GROUP BY familyId
+    ) f ON s.familyId = f.familyId
+    LEFT JOIN (
+        SELECT productId, argMax(productName, updatedAt) as productName
+        FROM products_dimension
+        GROUP BY productId
+    ) p ON s.productId = p.productId
+    LEFT JOIN (
+        SELECT companyId, argMax(companyName, updatedAt) as companyName
+        FROM companies_dimension
+        GROUP BY companyId
+    ) co ON s.companyId = co.companyId
+    LEFT JOIN (
+        SELECT sellerId, argMax(sellerName, updatedAt) as sellerName
+        FROM sellers_dimension
+        GROUP BY sellerId
+    ) se ON s.sellerId = se.sellerId
+    WHERE s.status = 'completed'
+        AND s.currentPrice > 0
         {% if defined(company_name) %}
-        AND companyName = {{String(company_name)}}
+        AND co.companyName IN {{Array(company_name, 'String')}}
         {% end %}
         {% if defined(seller_name) %}
-        AND sellerName = {{String(seller_name)}}
+        AND se.sellerName IN {{Array(seller_name, 'String')}}
         {% end %}
         {% if defined(product_name) %}
-        AND productName = {{String(product_name)}}
+        AND p.productName IN {{Array(product_name, 'String')}}
+        {% end %}
+        {% if defined(business_name) %}
+        AND b.businessName IN {{Array(business_name, 'String')}}
+        {% end %}
+        {% if defined(channel_name) %}
+        AND c.channelName IN {{Array(channel_name, 'String')}}
+        {% end %}
+        {% if defined(family_name) %}
+        AND f.familyName IN {{Array(family_name, 'String')}}
         {% end %}
         {% if defined(date_from) %}
-        AND scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
+        AND s.scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
         {% end %}
         {% if defined(date_to) %}
-        AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
+        AND s.scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
         {% end %}
         {% if defined(price_min) %}
-        AND currentPrice >= {{Float64(price_min)}}
+        AND s.currentPrice >= {{Float64(price_min)}}
         {% end %}
         {% if defined(price_max) %}
-        AND currentPrice <= {{Float64(price_max)}}
+        AND s.currentPrice <= {{Float64(price_max)}}
         {% end %}
     GROUP BY date
     ORDER BY date ASC

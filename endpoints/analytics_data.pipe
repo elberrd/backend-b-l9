@@ -3,53 +3,97 @@ TOKEN frontend_read READ
 DESCRIPTION >
     Main analytics data query with filtering support.
     Returns paginated scrape results for the analytics table.
+    Uses dimension table JOINs for business/channel/family names (so name changes auto-propagate).
 
 NODE analytics_data_node
 SQL >
     %
     SELECT
-        urlId,
-        productUrl,
-        status,
-        scrapedAt,
-        productTitle,
-        productName,
-        brandName,
-        companyName,
-        sellerName,
-        currentPrice,
-        originalPrice,
-        discountPercentage,
-        currency,
-        availability,
-        imageUrl,
-        screenshotUrl,
-        method
-    FROM product_scrapes
-    WHERE status = 'completed'
-        AND currentPrice > 0
+        s.urlId as urlId,
+        s.productUrl as productUrl,
+        s.status as status,
+        s.scrapedAt as scrapedAt,
+        s.productTitle as productTitle,
+        s.productName as productName,
+        s.brandName as brandName,
+        s.companyName as companyName,
+        s.sellerName as sellerName,
+        s.currentPrice as currentPrice,
+        s.originalPrice as originalPrice,
+        s.discountPercentage as discountPercentage,
+        s.currency as currency,
+        s.availability as availability,
+        s.imageUrl as imageUrl,
+        s.screenshotUrl as screenshotUrl,
+        s.method as method,
+        -- Include dimension names from JOINs (current names, not snapshot)
+        b.businessName as currentBusinessName,
+        c.channelName as currentChannelName,
+        f.familyName as currentFamilyName
+    FROM product_scrapes s
+    LEFT JOIN (
+        SELECT businessId, argMax(businessName, updatedAt) as businessName
+        FROM business_dimension
+        GROUP BY businessId
+    ) b ON s.businessId = b.businessId
+    LEFT JOIN (
+        SELECT channelId, argMax(channelName, updatedAt) as channelName
+        FROM channels_dimension
+        GROUP BY channelId
+    ) c ON s.channelId = c.channelId
+    LEFT JOIN (
+        SELECT familyId, argMax(familyName, updatedAt) as familyName
+        FROM families_dimension
+        GROUP BY familyId
+    ) f ON s.familyId = f.familyId
+    LEFT JOIN (
+        SELECT productId, argMax(productName, updatedAt) as productName
+        FROM products_dimension
+        GROUP BY productId
+    ) p ON s.productId = p.productId
+    LEFT JOIN (
+        SELECT companyId, argMax(companyName, updatedAt) as companyName
+        FROM companies_dimension
+        GROUP BY companyId
+    ) co ON s.companyId = co.companyId
+    LEFT JOIN (
+        SELECT sellerId, argMax(sellerName, updatedAt) as sellerName
+        FROM sellers_dimension
+        GROUP BY sellerId
+    ) se ON s.sellerId = se.sellerId
+    WHERE s.status = 'completed'
+        AND s.currentPrice > 0
         {% if defined(company_name) %}
-        AND companyName = {{String(company_name)}}
+        AND co.companyName IN {{Array(company_name, 'String')}}
         {% end %}
         {% if defined(seller_name) %}
-        AND sellerName = {{String(seller_name)}}
+        AND se.sellerName IN {{Array(seller_name, 'String')}}
         {% end %}
         {% if defined(product_name) %}
-        AND productName = {{String(product_name)}}
+        AND p.productName IN {{Array(product_name, 'String')}}
+        {% end %}
+        {% if defined(business_name) %}
+        AND b.businessName IN {{Array(business_name, 'String')}}
+        {% end %}
+        {% if defined(channel_name) %}
+        AND c.channelName IN {{Array(channel_name, 'String')}}
+        {% end %}
+        {% if defined(family_name) %}
+        AND f.familyName IN {{Array(family_name, 'String')}}
         {% end %}
         {% if defined(date_from) %}
-        AND scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
+        AND s.scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})
         {% end %}
         {% if defined(date_to) %}
-        AND scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
+        AND s.scrapedAt <= parseDateTimeBestEffort({{String(date_to)}})
         {% end %}
         {% if defined(price_min) %}
-        AND currentPrice >= {{Float64(price_min)}}
+        AND s.currentPrice >= {{Float64(price_min)}}
         {% end %}
         {% if defined(price_max) %}
-        AND currentPrice <= {{Float64(price_max)}}
+        AND s.currentPrice <= {{Float64(price_max)}}
         {% end %}
-    ORDER BY scrapedAt DESC
+    ORDER BY s.scrapedAt DESC
     LIMIT {{Int32(limit, 1000)}}
     OFFSET {{Int32(offset, 0)}}
 
