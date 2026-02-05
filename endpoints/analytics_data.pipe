@@ -29,7 +29,8 @@ SQL >
         -- Include dimension names from JOINs (current names, not snapshot)
         b.businessName as currentBusinessName,
         c.channelName as currentChannelName,
-        f.familyName as currentFamilyName
+        f.familyName as currentFamilyName,
+        p.productName as currentProductName
     FROM product_scrapes s
     LEFT JOIN (
         SELECT businessId, argMax(businessName, updatedAt) as businessName
