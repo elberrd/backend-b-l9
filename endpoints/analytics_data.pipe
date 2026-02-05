@@ -52,11 +52,6 @@ SQL >
         GROUP BY productId
     ) p ON s.productId = p.productId
     LEFT JOIN (
-        SELECT companyId, argMax(companyName, updatedAt) as companyName
-        FROM companies_dimension
-        GROUP BY companyId
-    ) co ON s.companyId = co.companyId
-    LEFT JOIN (
         SELECT sellerId, argMax(sellerName, updatedAt) as sellerName
         FROM sellers_dimension
         GROUP BY sellerId
@@ -64,7 +59,7 @@ SQL >
     WHERE s.status = 'completed'
         AND s.currentPrice > 0
         {% if defined(company_name) %}
-        AND co.companyName IN {{Array(company_name, 'String')}}
+        AND s.companyName IN {{Array(company_name, 'String')}}
         {% end %}
         {% if defined(seller_name) %}
         AND se.sellerName IN {{Array(seller_name, 'String')}}
