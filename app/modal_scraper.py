@@ -916,7 +916,7 @@ class TinybirdBatcher:
             "errorMessage": scrape_result.get("errorMessage"),
             "screenshotUrl": scrape_result.get("screenshotUrl"),
             "productTitle": scrape_result.get("productTitle"),
-            "productName": scrape_result.get("productTitle"),
+            "productName": scrape_result.get("productName") or scrape_result.get("productTitle"),
             "brand": scrape_result.get("brand"),
             "brandName": scrape_result.get("brand"),
             "currentPrice": scrape_result.get("currentPrice"),
@@ -926,7 +926,7 @@ class TinybirdBatcher:
             "availability": 1 if scrape_result.get("availability") else (0 if scrape_result.get("availability") is False else None),
             "imageUrl": scrape_result.get("product_image_url"),
             "seller": scrape_result.get("seller"),
-            "sellerName": scrape_result.get("seller"),
+            "sellerName": scrape_result.get("sellerName") or scrape_result.get("seller"),
             "shippingInfo": scrape_result.get("shippingInfo"),
             "shippingCost": scrape_result.get("shippingCost"),
             "deliveryTime": scrape_result.get("deliveryTime"),
@@ -956,6 +956,13 @@ class TinybirdBatcher:
             "channelName": scrape_result.get("channelName"),
             "familyId": scrape_result.get("familyId"),
             "familyName": scrape_result.get("familyName"),
+            # Convex reference IDs
+            "productId": scrape_result.get("productId"),
+            "sellerId": scrape_result.get("sellerId"),
+            # Alert configuration
+            "minPrice": scrape_result.get("minPrice"),
+            "maxPrice": scrape_result.get("maxPrice"),
+            "alertsEnabled": 1 if scrape_result.get("alertsEnabled") else (0 if scrape_result.get("alertsEnabled") is False else None),
         }
 
         return {k: v for k, v in record.items() if v is not None}
