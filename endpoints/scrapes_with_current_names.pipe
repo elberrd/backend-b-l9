@@ -1,5 +1,6 @@
 NODE scrapes_with_current_names_node
 SQL >
+    %
     SELECT
         s.urlId,
         s.scrapedAt,
@@ -36,8 +37,6 @@ SQL >
         s.minPrice,
         s.maxPrice,
         s.alertsEnabled,
-        s.alertTriggered,
-        s.alertType,
         s.productUrl,
         s.method
     FROM product_scrapes s
@@ -49,15 +48,14 @@ SQL >
         SELECT sellerId, argMax(sellerName, updatedAt) as sellerName, argMax(country, updatedAt) as country
         FROM sellers_dimension GROUP BY sellerId
     ) sel ON s.sellerId = sel.sellerId
-    WHERE
+    WHERE 1=1
         {% if defined(url_id) %}
-            s.urlId = {{ String(url_id) }}
+        AND s.urlId = {{ String(url_id) }}
         {% end %}
         {% if defined(product_id) %}
-            AND s.productId = {{ String(product_id) }}
+        AND s.productId = {{ String(product_id) }}
         {% end %}
     ORDER BY s.scrapedAt DESC
     LIMIT {{ Int32(limit, 100) }}
 
-TYPE materialized
-DATASOURCE scrapes_with_current_names_ds
+TYPE endpoint

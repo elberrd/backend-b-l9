@@ -7,5 +7,5 @@ SCHEMA >
 
 ENGINE "ReplacingMergeTree"
 ENGINE_PARTITION_KEY "toYYYYMM(updatedAt)"
-ENGINE_SORTING_KEY "productId, updatedAt"
+ENGINE_SORTING_KEY "productId"
 ENGINE_VER "updatedAt"

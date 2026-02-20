@@ -1,5 +1,6 @@
 NODE scrapes_by_product_id_node
 SQL >
+    %
     SELECT
         s.*,
         p.productName as currentProductName
@@ -15,5 +16,4 @@ SQL >
     ORDER BY s.scrapedAt DESC
     LIMIT {{ Int32(limit, 1000) }}
 
-TYPE materialized
-DATASOURCE scrapes_by_product_id_ds
+TYPE endpoint
