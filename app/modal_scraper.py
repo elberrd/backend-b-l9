@@ -903,6 +903,54 @@ class TinybirdBatcher:
         except asyncio.CancelledError:
             pass
 
+    @staticmethod
+    def _to_string(value) -> str | None:
+        """Convert a value to string for Tinybird Nullable(String) columns.
+        If value is a list/array, join with ' | '. If dict/other, json.dumps."""
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return " | ".join(str(item) for item in value) if value else None
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    @staticmethod
+    def _to_float(value) -> float | None:
+        """Convert a value to float for Tinybird Float64 columns. Returns None if not numeric."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            # Try to extract a number from strings like "R$ 14,90" or "14.90"
+            cleaned = value.replace(",", ".").strip()
+            match = re.search(r'[\d]+\.?[\d]*', cleaned)
+            if match:
+                try:
+                    return float(match.group())
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    @staticmethod
+    def _to_int(value) -> int | None:
+        """Convert a value to int for Tinybird Int32 columns. Returns None if not numeric."""
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            match = re.search(r'[\d]+', value)
+            if match:
+                try:
+                    return int(match.group())
+                except (ValueError, TypeError):
+                    return None
+        return None
+
     def _prepare_record(self, scrape_result: dict) -> dict:
         """Convert scrape result to Tinybird-compatible record."""
         scraped_at_ms = scrape_result.get("scrapedAt", int(time.time() * 1000))
@@ -928,19 +976,19 @@ class TinybirdBatcher:
             "seller": scrape_result.get("seller"),
             "sellerName": scrape_result.get("sellerName") or scrape_result.get("seller"),
             "shippingInfo": scrape_result.get("shippingInfo"),
-            "shippingCost": scrape_result.get("shippingCost"),
+            "shippingCost": self._to_float(scrape_result.get("shippingCost")),
             "deliveryTime": scrape_result.get("deliveryTime"),
             "review_score": str(scrape_result.get("review_score")) if scrape_result.get("review_score") is not None else None,
-            "installmentOptions": scrape_result.get("installmentOptions"),
+            "installmentOptions": self._to_string(scrape_result.get("installmentOptions")),
             "kit": 1 if scrape_result.get("kit") else (0 if scrape_result.get("kit") is False else None),
             "unitMeasurement": scrape_result.get("unitMeasurement"),
             "outOfStockReason": scrape_result.get("outOfStockReason"),
             "marketplaceWebsite": scrape_result.get("marketplaceWebsite"),
-            "sku": scrape_result.get("sku"),
+            "sku": self._to_string(scrape_result.get("sku")),
             "ean": scrape_result.get("ean"),
-            "stockQuantity": scrape_result.get("stockQuantity"),
-            "otherPaymentMethods": scrape_result.get("otherPaymentMethods"),
-            "promotionDetails": scrape_result.get("promotionDetails"),
+            "stockQuantity": self._to_int(scrape_result.get("stockQuantity")),
+            "otherPaymentMethods": self._to_string(scrape_result.get("otherPaymentMethods")),
+            "promotionDetails": self._to_string(scrape_result.get("promotionDetails")),
             "method": scrape_result.get("method"),
             "attempts": json.dumps(scrape_result.get("attempts")) if scrape_result.get("attempts") else None,
             "errors": json.dumps(scrape_result.get("errors")) if scrape_result.get("errors") else None,
