@@ -1,0 +1,44 @@
+TOKEN frontend_read READ
+
+DESCRIPTION >
+    Get price history time series for selected products and sellers.
+    Returns all scrapes within a date range for trend charts.
+    Calculates effectivePrice (originalPrice if > 0, otherwise currentPrice).
+
+NODE price_history_timeseries_node
+SQL >
+    %
+    SELECT
+        COALESCE(ps.productId, '') as productId,
+        COALESCE(ps.productName, ps.productTitle, '') as productName,
+        COALESCE(ps.sellerId, '') as sellerId,
+        COALESCE(ps.sellerName, '') as sellerName,
+        ps.scrapedAt as scrapedAt,
+        COALESCE(ps.currentPrice, 0) as currentPrice,
+        ps.originalPrice as originalPrice,
+        if(
+            COALESCE(ps.originalPrice, 0) > 0,
+            ps.originalPrice,
+            COALESCE(ps.currentPrice, 0)
+        ) as effectivePrice,
+        COALESCE(ps.channelName, ps.companyName, '') as channelName,
+        COALESCE(ps.availability, 0) as availability
+    FROM product_scrapes ps
+    WHERE ps.status = 'completed'
+        AND COALESCE(ps.currentPrice, 0) > 0
+        {% if defined(product_id) %}
+        AND ps.productId IN ({{ Array(product_id, 'String') }})
+        {% end %}
+        {% if defined(seller_id) %}
+        AND ps.sellerId IN ({{ Array(seller_id, 'String') }})
+        {% end %}
+        {% if defined(date_from) %}
+        AND ps.scrapedAt >= parseDateTimeBestEffort({{ String(date_from) }})
+        {% end %}
+        {% if defined(date_to) %}
+        AND ps.scrapedAt <= parseDateTimeBestEffort({{ String(date_to) }})
+        {% end %}
+    ORDER BY ps.scrapedAt ASC
+    LIMIT {{ Int32(limit, 50000) }}
+
+TYPE endpoint

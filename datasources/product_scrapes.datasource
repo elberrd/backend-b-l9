@@ -52,7 +52,8 @@ SCHEMA >
     `channelId` Nullable(String) `json:$.channelId`,
     `channelName` Nullable(String) `json:$.channelName`,
     `familyId` Nullable(String) `json:$.familyId`,
-    `familyName` Nullable(String) `json:$.familyName`
+    `familyName` Nullable(String) `json:$.familyName`,
+    `companyId` Nullable(String) `json:$.companyId`
 
 ENGINE "MergeTree"
 ENGINE_PARTITION_KEY "toYYYYMM(scrapedAt)"

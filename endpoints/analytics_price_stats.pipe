@@ -3,7 +3,7 @@ TOKEN frontend_read READ
 DESCRIPTION >
     Aggregated price statistics for analytics dashboard.
     Returns count, avg, min, max, and median prices.
-    Uses dimension table JOINs for business/channel/family filtering (so name changes auto-propagate).
+    Filters use denormalized fields from product_scrapes directly.
 
 NODE analytics_price_stats_node
 SQL >
@@ -16,50 +16,25 @@ SQL >
         round(median(s.currentPrice), 2) as medianPrice,
         round(stddevPop(s.currentPrice), 2) as stdDevPrice
     FROM product_scrapes s
-    LEFT JOIN (
-        SELECT businessId, argMax(businessName, updatedAt) as businessName
-        FROM business_dimension
-        GROUP BY businessId
-    ) b ON s.businessId = b.businessId
-    LEFT JOIN (
-        SELECT channelId, argMax(channelName, updatedAt) as channelName
-        FROM channels_dimension
-        GROUP BY channelId
-    ) c ON s.channelId = c.channelId
-    LEFT JOIN (
-        SELECT familyId, argMax(familyName, updatedAt) as familyName
-        FROM families_dimension
-        GROUP BY familyId
-    ) f ON s.familyId = f.familyId
-    LEFT JOIN (
-        SELECT productId, argMax(productName, updatedAt) as productName
-        FROM products_dimension
-        GROUP BY productId
-    ) p ON s.productId = p.productId
-    LEFT JOIN (
-        SELECT sellerId, argMax(sellerName, updatedAt) as sellerName
-        FROM sellers_dimension
-        GROUP BY sellerId
-    ) se ON s.sellerId = se.sellerId
     WHERE s.status = 'completed'
         AND s.currentPrice > 0
         {% if defined(company_name) %}
         AND s.companyName IN {{Array(company_name, 'String')}}
         {% end %}
         {% if defined(seller_name) %}
-        AND se.sellerName IN {{Array(seller_name, 'String')}}
+        AND s.sellerName IN {{Array(seller_name, 'String')}}
         {% end %}
         {% if defined(product_name) %}
-        AND p.productName IN {{Array(product_name, 'String')}}
+        AND s.productName IN {{Array(product_name, 'String')}}
         {% end %}
         {% if defined(business_name) %}
-        AND b.businessName IN {{Array(business_name, 'String')}}
+        AND s.businessName IN {{Array(business_name, 'String')}}
         {% end %}
         {% if defined(channel_name) %}
-        AND c.channelName IN {{Array(channel_name, 'String')}}
+        AND s.channelName IN {{Array(channel_name, 'String')}}
         {% end %}
         {% if defined(family_name) %}
-        AND f.familyName IN {{Array(family_name, 'String')}}
+        AND s.familyName IN {{Array(family_name, 'String')}}
         {% end %}
         {% if defined(date_from) %}
         AND s.scrapedAt >= parseDateTimeBestEffort({{String(date_from)}})

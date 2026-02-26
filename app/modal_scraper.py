@@ -994,6 +994,7 @@ class TinybirdBatcher:
             "errors": json.dumps(scrape_result.get("errors")) if scrape_result.get("errors") else None,
             # New fields from Tinybird schema
             "alertId": scrape_result.get("alertId"),
+            "companyId": scrape_result.get("companyId"),
             "companyName": scrape_result.get("companyName"),
             "hasAlert": 1 if scrape_result.get("hasAlert") else (0 if scrape_result.get("hasAlert") is False else None),
             "screenshotId": scrape_result.get("screenshotId"),
@@ -1149,6 +1150,189 @@ class TinybirdBatcher:
             success_rate = ((self._total_batches - self._failed_batches) / self._total_batches) * 100
             print(f"Success rate: {success_rate:.1f}%")
         print(f"{'='*60}\n")
+
+
+# =============================================================================
+# Convex Batcher (Convex-first architecture)
+# =============================================================================
+
+class ConvexBatcher:
+    """
+    Batch sender for Convex HTTP ingestion endpoint.
+    Reuses the same _prepare_record from TinybirdBatcher for type normalization.
+
+    Usage:
+        async with ConvexBatcher(convex_ingest_url, batch_id, trigger_type) as batcher:
+            await batcher.add(record1)
+            await batcher.add(record2)
+    """
+
+    def __init__(
+        self,
+        convex_ingest_url: str,
+        batch_id: str = "",
+        trigger_type: str = "manual",
+        batch_size: int = 10,
+        max_retries: int = 3,
+    ):
+        self.convex_ingest_url = convex_ingest_url
+        self.batch_id = batch_id
+        self.trigger_type = trigger_type
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        self._buffer: List[dict] = []
+        self._lock = asyncio.Lock()
+        self._client = None
+        self._tb_batcher_for_prepare = TinybirdBatcher.__new__(TinybirdBatcher)
+        # Metrics
+        self._total_records = 0
+        self._total_batches = 0
+        self._failed_batches = 0
+
+    async def __aenter__(self):
+        import httpx
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.flush()
+        if self._client:
+            await self._client.aclose()
+        self._print_metrics()
+        return False
+
+    async def add(self, scrape_result: dict):
+        """Add a scrape result (uses TinybirdBatcher._prepare_record for normalization)."""
+        record = self._tb_batcher_for_prepare._prepare_record(scrape_result)
+        async with self._lock:
+            self._buffer.append(record)
+            self._total_records += 1
+            if len(self._buffer) >= self.batch_size:
+                await self._flush_internal()
+
+    async def flush(self):
+        async with self._lock:
+            if self._buffer:
+                await self._flush_internal()
+
+    async def _flush_internal(self):
+        if not self._buffer:
+            return
+        batch = self._buffer.copy()
+        self._buffer.clear()
+        success = await self._send_batch(batch)
+        self._total_batches += 1
+        if not success:
+            self._failed_batches += 1
+
+    async def _send_batch(self, batch: List[dict]) -> bool:
+        import httpx
+
+        payload = {
+            "records": batch,
+            "batchId": self.batch_id,
+            "triggerType": self.trigger_type,
+        }
+
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = await self._client.post(
+                    self.convex_ingest_url,
+                    headers={
+                        "Content-Type": "application/json",
+                    },
+                    content=payload_json.encode('utf-8'),
+                )
+
+                if response.status_code in (200, 202):
+                    result = response.json()
+                    print(f"[ConvexBatcher] Sent {len(batch)} records → inserted={result.get('inserted', 0)}, errors={result.get('errors', 0)}")
+                    return True
+                else:
+                    print(f"[ConvexBatcher] HTTP {response.status_code}: {response.text[:200]}")
+            except httpx.TimeoutException:
+                print(f"[ConvexBatcher] Timeout on attempt {attempt}/{self.max_retries}")
+            except Exception as e:
+                print(f"[ConvexBatcher] Error: {str(e)[:200]}")
+
+            if attempt < self.max_retries:
+                delay = 2 ** attempt + random.uniform(0, 1)
+                print(f"[ConvexBatcher] Retrying in {delay:.1f}s...")
+                await asyncio.sleep(delay)
+
+        print(f"[ConvexBatcher] FAILED after {self.max_retries} attempts, lost {len(batch)} records")
+        return False
+
+    def _print_metrics(self):
+        print(f"\n{'='*60}")
+        print(f"CONVEX BATCHER METRICS")
+        print(f"{'='*60}")
+        print(f"Total records: {self._total_records}")
+        print(f"Total batches: {self._total_batches}")
+        print(f"Failed batches: {self._failed_batches}")
+        if self._total_batches > 0:
+            rate = ((self._total_batches - self._failed_batches) / self._total_batches) * 100
+            print(f"Success rate: {rate:.1f}%")
+        print(f"{'='*60}\n")
+
+
+# =============================================================================
+# Dual Batcher (Convex + Tinybird simultaneous write)
+# =============================================================================
+
+class DualBatcher:
+    """
+    Writes to both Convex (primary) and Tinybird (analytics) simultaneously.
+    Tinybird failures are logged but do NOT block the Convex write.
+
+    Usage:
+        async with DualBatcher(convex_url, batch_id, trigger) as batcher:
+            await batcher.add(record)
+    """
+
+    def __init__(
+        self,
+        convex_ingest_url: str,
+        batch_id: str = "",
+        trigger_type: str = "manual",
+    ):
+        self._convex = ConvexBatcher(convex_ingest_url, batch_id, trigger_type)
+        self._tinybird = TinybirdBatcher()
+
+    async def __aenter__(self):
+        await self._convex.__aenter__()
+        await self._tinybird.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Flush both — Tinybird errors are caught internally
+        try:
+            await self._tinybird.__aexit__(exc_type, exc_val, exc_tb)
+        except Exception as e:
+            print(f"[DualBatcher] Tinybird exit error (non-blocking): {e}")
+        await self._convex.__aexit__(exc_type, exc_val, exc_tb)
+        return False
+
+    async def add(self, scrape_result: dict):
+        """Add record to both batchers. Tinybird failure is non-blocking."""
+        # Convex is the primary — always await
+        await self._convex.add(scrape_result)
+        # Tinybird is secondary — catch errors
+        try:
+            await self._tinybird.add(scrape_result)
+        except Exception as e:
+            url_id = scrape_result.get("urlId", "unknown")
+            print(f"[DualBatcher] Tinybird add failed for {url_id} (non-blocking): {e}")
+
+    async def flush(self):
+        """Flush both batchers."""
+        try:
+            await self._tinybird.flush()
+        except Exception as e:
+            print(f"[DualBatcher] Tinybird flush error (non-blocking): {e}")
+        await self._convex.flush()
 
 
 # =============================================================================
@@ -1623,6 +1807,7 @@ def extract_initial_data(item: dict) -> dict:
         "sellerId": "sellerId",
         # Metadata fields from input
         "alertId": "alertId",
+        "companyId": "companyId",
         "companyName": "companyName",
         "hasAlert": "hasAlert",
         "screenshotId": "screenshotId",
@@ -2261,26 +2446,47 @@ async def process_batch(urls_data: List[dict]) -> List[dict]:
     print(f"Scrape Time: {scrape_elapsed:.2f}s | Rate: {len(processed_results)/scrape_elapsed:.2f} URLs/sec")
     print(f"{'='*60}\n")
 
-    # Send all results to Tinybird using the batcher
-    print(f"\n{'='*60}")
-    print(f"SENDING TO TINYBIRD (batched)")
-    print(f"{'='*60}")
+    # Determine ingest destination: Convex (preferred) or Tinybird (fallback)
+    # convexIngestUrl and batchId are injected by the caller (process_batch_with_job)
+    convex_ingest_url = None
+    batch_id_for_ingest = None
+    trigger_type_for_ingest = "manual"
 
-    tinybird_start = time.time()
+    # Check if any URL item has the convex ingest info (passed through initial_data)
+    if urls_data and len(urls_data) > 0:
+        first_item = urls_data[0] if isinstance(urls_data[0], dict) else {}
+        convex_ingest_url = first_item.get("_convexIngestUrl")
+        batch_id_for_ingest = first_item.get("_batchId")
+        trigger_type_for_ingest = first_item.get("_triggerType", "manual")
 
-    async with TinybirdBatcher() as batcher:
-        for result in processed_results:
-            await batcher.add(result)
-        # Batcher auto-flushes remaining records on context exit
+    ingest_start = time.time()
 
-    tinybird_elapsed = time.time() - tinybird_start
+    if convex_ingest_url:
+        print(f"\n{'='*60}")
+        print(f"SENDING TO CONVEX + TINYBIRD (dual-write) → {convex_ingest_url}")
+        print(f"{'='*60}")
+
+        async with DualBatcher(convex_ingest_url, batch_id_for_ingest or "", trigger_type_for_ingest) as batcher:
+            for result in processed_results:
+                await batcher.add(result)
+    else:
+        # Fallback: send to Tinybird directly (legacy path)
+        print(f"\n{'='*60}")
+        print(f"SENDING TO TINYBIRD (batched) — legacy path")
+        print(f"{'='*60}")
+
+        async with TinybirdBatcher() as batcher:
+            for result in processed_results:
+                await batcher.add(result)
+
+    ingest_elapsed = time.time() - ingest_start
     total_elapsed = time.time() - start_time
 
     print(f"\n{'='*60}")
     print(f"BATCH COMPLETE")
     print(f"{'='*60}")
     print(f"Scrape Time: {scrape_elapsed:.2f}s")
-    print(f"Tinybird Time: {tinybird_elapsed:.2f}s")
+    print(f"Ingest Time: {ingest_elapsed:.2f}s")
     print(f"Total Time: {total_elapsed:.2f}s")
     print(f"{'='*60}\n")
 
@@ -2654,7 +2860,14 @@ class TinybirdJobManager:
     timeout=7200,  # 2 hours for large batches
     secrets=[modal.Secret.from_name("bausch")],
 )
-async def process_batch_with_job(job_id: str, urls_data: List[dict], webhook_url: Optional[str] = None) -> dict:
+async def process_batch_with_job(
+    job_id: str,
+    urls_data: List[dict],
+    webhook_url: Optional[str] = None,
+    convex_ingest_url: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    trigger_type: Optional[str] = None,
+) -> dict:
     """
     Process batch with job tracking in Tinybird.
 
@@ -2663,9 +2876,16 @@ async def process_batch_with_job(job_id: str, urls_data: List[dict], webhook_url
     2. Runs the scraping
     3. Updates job status to 'completed'/'partial'/'failed'
     4. Sends webhook if configured
-    5. Returns summary (not full results - those go to product_scrapes)
+    5. Returns summary (not full results - those go to Convex/product_scrapes)
     """
     job_manager = TinybirdJobManager()
+
+    # Inject Convex ingest metadata into urls_data so process_batch can pick it up
+    if convex_ingest_url and urls_data:
+        for item in urls_data:
+            item["_convexIngestUrl"] = convex_ingest_url
+            item["_batchId"] = batch_id or ""
+            item["_triggerType"] = trigger_type or "manual"
 
     # Extract company name from first URL if available
     company_name = None
@@ -2840,6 +3060,9 @@ def scraper_api():
         urls: List[UrlItem] = Field(..., min_length=1, max_length=10000)
         webhookUrl: Optional[str] = Field(None, description="Webhook URL for completion notification")
         companyName: Optional[str] = Field(None, description="Company name for all URLs")
+        convexIngestUrl: Optional[str] = Field(None, description="Convex HTTP endpoint for scrape data ingestion")
+        batchId: Optional[str] = Field(None, description="Batch identifier for Convex tracking")
+        triggerType: Optional[str] = Field(None, description="Trigger type: 'cron' or 'manual'")
 
     class ScrapeResponse(BaseModel):
         jobId: str
@@ -2934,7 +3157,14 @@ def scraper_api():
         await job_manager.close()
 
         # Spawn the batch processing (non-blocking)
-        process_batch_with_job.spawn(job_id, urls_data, body.webhookUrl)
+        process_batch_with_job.spawn(
+            job_id,
+            urls_data,
+            body.webhookUrl,
+            body.convexIngestUrl,
+            body.batchId,
+            body.triggerType,
+        )
 
         return ScrapeResponse(
             jobId=job_id,
