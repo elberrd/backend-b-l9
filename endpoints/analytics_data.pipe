@@ -29,7 +29,10 @@ SQL >
         s.businessName as currentBusinessName,
         s.channelName as currentChannelName,
         s.familyName as currentFamilyName,
-        s.productName as currentProductName
+        s.productName as currentProductName,
+        s.installmentOptions as installmentOptions,
+        s.otherPaymentMethods as otherPaymentMethods,
+        s.promotionDetails as promotionDetails
     FROM product_scrapes s
     WHERE s.status = 'completed'
         AND s.currentPrice > 0
